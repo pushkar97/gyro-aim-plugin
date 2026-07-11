@@ -21,7 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "common.h"
+#include "gyro_common.h"
 #include "config.h"
 
 #define CALIB_SAMPLE_COUNT 500        // ~1-2s at typical pad poll rates

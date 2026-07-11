@@ -12,7 +12,7 @@
 #include <stdio.h>
 #include <sys/stat.h>
 
-#include "common.h"
+#include "gyro_common.h"
 #include "config.h"
 #include "gyro.h"
 #include "pad.h"

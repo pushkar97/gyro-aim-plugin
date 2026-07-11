@@ -71,12 +71,55 @@ plugin) exist, and they disagree on some details:
 
 ## Prerequisites
 
-- [OpenOrbis-PS4-Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain),
-  cloned locally, with `OO_PS4_TOOLCHAIN` pointing at it.
-- [GoldHEN_Plugins_SDK](https://github.com/GoldHEN/GoldHEN_Plugins_SDK),
-  cloned locally, with `GOLDHEN_SDK` pointing at it.
-- clang/lld (on macOS: `brew install llvm`, matching the paths the Makefile
-  expects — see `Makefile` if your `llvm` isn't at `/usr/local/opt/llvm`).
+Tested and working end-to-end on macOS (Apple Silicon) as of this writing.
+
+1. **OpenOrbis toolchain — download the release, do NOT `git clone` the repo.**
+   The git repo intentionally excludes the full header/library-stub set (to
+   avoid bloating it); those only ship in the GitHub Releases tarball.
+   ```sh
+   curl -sL -o /tmp/oo-toolchain.tar.gz \
+     https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/latest/download/toolchain-llvm-18.tar.gz
+   mkdir /tmp/oo-extract && tar -xzf /tmp/oo-toolchain.tar.gz -C /tmp/oo-extract
+   mv /tmp/oo-extract/OpenOrbis/PS4Toolchain /path/to/OpenOrbis-PS4-Toolchain
+   export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis-PS4-Toolchain
+   ```
+
+2. **GoldHEN_Plugins_SDK — regular git clone is fine here.**
+   ```sh
+   git clone https://github.com/GoldHEN/GoldHEN_Plugins_SDK.git
+   export GOLDHEN_SDK=/path/to/GoldHEN_Plugins_SDK
+   ```
+   Then build it (produces `libGoldHEN_Hook.a` + `build/crtprx.o`, which this
+   plugin's Makefile links against):
+   ```sh
+   cd $GOLDHEN_SDK && make
+   ```
+
+3. **clang + lld, on macOS via Homebrew.** Apple's bundled clang doesn't work
+   for this target; you need upstream LLVM. Note `lld` is a *separate*
+   Homebrew formula from `llvm` (it doesn't bundle `ld.lld`):
+   ```sh
+   brew install llvm lld
+   ```
+   On Apple Silicon, Homebrew's `llvm`/`lld` install under `/opt/homebrew`,
+   not the `/usr/local/opt/llvm` path some upstream Makefiles hardcode (an
+   Intel-Homebrew-era assumption). This plugin's own `Makefile` auto-detects
+   the right prefix via `brew --prefix llvm`/`brew --prefix lld` with
+   fallbacks. If you build `GoldHEN_Plugins_SDK` itself and hit
+   `/usr/local/opt/llvm/bin/clang: No such file or directory`, override on
+   the command line instead of patching its Makefile:
+   ```sh
+   make CC=$(brew --prefix llvm)/bin/clang \
+        CCX=$(brew --prefix llvm)/bin/clang++ \
+        LD=$(brew --prefix lld)/bin/ld.lld \
+        AR=$(brew --prefix llvm)/bin/llvm-ar
+   ```
+
+4. **Rosetta 2, on Apple Silicon.** The toolchain's `create-fself` binary for
+   macOS (`bin/macos/create-fself-macos`) is x86_64-only.
+   ```sh
+   softwareupdate --install-rosetta --agree-to-license
+   ```
 
 ```sh
 export OO_PS4_TOOLCHAIN=/path/to/OpenOrbis-PS4-Toolchain
@@ -84,7 +127,9 @@ export GOLDHEN_SDK=/path/to/GoldHEN_Plugins_SDK
 make
 ```
 
-Produces `build/prx_final/gyro_aim.prx`.
+Produces `build/prx_final/gyro_aim.prx`. `make DEBUG=1` builds the
+`__FINAL__=0` variant (`build/prx_debug/gyro_aim.prx`) with `klog` chatter
+enabled for every code path guarded by non-`final_printf`-style logging.
 
 ## Installing on console
 

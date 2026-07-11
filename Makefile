@@ -56,11 +56,36 @@ ifeq ($(UNAME_S),Linux)
     CC   := clang
     LD   := ld.lld
     CDIR := linux
+    CREATE_FSELF_BIN := create-fself
 endif
 ifeq ($(UNAME_S),Darwin)
-    CC   := /usr/local/opt/llvm/bin/clang
-    LD   := /usr/local/opt/llvm/bin/ld.lld
+    # Homebrew's llvm is keg-only and lives under a different prefix on
+    # Apple Silicon (/opt/homebrew) vs Intel (/usr/local). Prefer `brew
+    # --prefix llvm` when available, falling back to the two conventional
+    # locations. lld is a *separate* Homebrew formula from llvm (it doesn't
+    # bundle ld.lld), so its prefix is resolved independently.
+    LLVM_PREFIX := $(shell brew --prefix llvm 2>/dev/null)
+    ifeq ($(LLVM_PREFIX),)
+        ifneq ($(wildcard /opt/homebrew/opt/llvm/bin/clang),)
+            LLVM_PREFIX := /opt/homebrew/opt/llvm
+        else
+            LLVM_PREFIX := /usr/local/opt/llvm
+        endif
+    endif
+    LLD_PREFIX := $(shell brew --prefix lld 2>/dev/null)
+    ifeq ($(LLD_PREFIX),)
+        ifneq ($(wildcard /opt/homebrew/opt/lld/bin/ld.lld),)
+            LLD_PREFIX := /opt/homebrew/opt/lld
+        else
+            LLD_PREFIX := /usr/local/opt/lld
+        endif
+    endif
+    CC   := $(LLVM_PREFIX)/bin/clang
+    LD   := $(LLD_PREFIX)/bin/ld.lld
     CDIR := macos
+    # The macOS release binary is (inconsistently vs. Linux) named
+    # create-fself-macos rather than create-fself.
+    CREATE_FSELF_BIN := create-fself-macos
 endif
 
 .PHONY: all clean dirs
@@ -72,7 +97,7 @@ dirs:
 
 $(TARGET_PRX): $(OBJS)
 	$(LD) $(GH_SDK)/build/crtprx.o $(OBJS) -o $(TARGET_ELF) $(LDFLAGS)
-	$(TOOLCHAIN)/bin/$(CDIR)/create-fself -in=$(TARGET_ELF) -out=$(TARGET_ELF).oelf --lib=$(TARGET_PRX) --paid 0x3800000000000011
+	$(TOOLCHAIN)/bin/$(CDIR)/$(CREATE_FSELF_BIN) -in=$(TARGET_ELF) -out=$(TARGET_ELF).oelf --lib=$(TARGET_PRX) --paid 0x3800000000000011
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) -o $@ $<
