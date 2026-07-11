@@ -1,0 +1,37 @@
+// Gyro-to-stick mapping, calibration/drift correction, and hotkey/state
+// handling for the gyro-aim plugin. See main.c for the scePad hook glue.
+#pragma once
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "pad.h"
+
+// Per-title (or [default]) config, loaded once at plugin_load.
+typedef struct GyroProfile {
+    bool enabled;
+    float sensitivity_h;    // stick units per rad/s, yaw -> stick X
+    float sensitivity_v;    // stick units per rad/s, pitch -> stick Y
+    float dead_zone;        // rad/s; |corrected gyro| below this is treated as 0
+    int dead_zone_bias;     // stick units (0-127); minimum push applied when
+                             // gyro contributes non-zero motion, so the game's
+                             // own internal stick deadzone doesn't eat it
+    int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
+    bool invert_x;
+    bool invert_y;
+} GyroProfile;
+
+// Loads [default] then overlays [<titleid>] (if present) from the given INI
+// file path into *out_profile. Missing keys keep whatever hardcoded defaults
+// gyro_profile_set_defaults() established. Returns false if the file itself
+// could not be opened (profile is left at defaults in that case).
+void gyro_profile_set_defaults(GyroProfile* profile);
+bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile);
+
+// One-time global init (call from plugin_load). Sets up calibration state.
+void gyro_state_init(const GyroProfile* profile);
+
+// Called from both scePadRead_hook and scePadReadState_hook for every
+// individual ScePadData sample, in order, before it's returned to the game.
+// `handle` is the pad handle (needed for scePadSetLightBar transitions).
+void gyro_process_sample(int32_t handle, ScePadData* pData);

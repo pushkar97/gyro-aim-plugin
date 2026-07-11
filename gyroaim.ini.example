@@ -1,0 +1,15 @@
+[default]
+Enabled = true
+SensitivityH = 40.0
+SensitivityV = 40.0
+DeadZone = 0.02
+DeadZoneBias = 20
+TriggerThreshold = 250
+InvertX = false
+InvertY = false
+
+; Example per-title override. Replace CUSA00001 with a real title ID
+; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).
+[CUSA00001]
+SensitivityH = 25.0
+SensitivityV = 25.0
