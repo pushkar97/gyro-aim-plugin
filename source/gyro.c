@@ -66,6 +66,8 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->invert_x = false;
     profile->invert_y = false;
     profile->yaw_from_z = false;
+    profile->curve_power = 2.0f;
+    profile->curve_min_rate = 0.15f;
 }
 
 static void load_section(ini_table_s* table, const char* section, GyroProfile* profile) {
@@ -81,6 +83,8 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_bool(table, section, "InvertX", &profile->invert_x);
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
     ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
+    ini_table_get_entry_as_float(table, section, "CurvePower", &profile->curve_power);
+    ini_table_get_entry_as_float(table, section, "CurveMinRate", &profile->curve_min_rate);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -158,6 +162,20 @@ static int clamp_int(int v, int lo, int hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;
     return v;
+}
+
+// Applies signed exponential curve to the gyro rate so small movements
+// ramp up smoothly while big flicks still reach full speed.  power=1.0
+// is linear (no curve); 2.0 (default) gives a gentle s-curve feel.
+// Values below `min_rate` are passed through linearly (not curved) so
+// tiny residual bias doesn't get exponentially amplified into a
+// directional asymmetry — the curve only kicks in above the threshold.
+static float signed_pow_curve(float v, float power, float min_rate) {
+    float av = fabsf(v);
+    if (v == 0.0f || power <= 0.001f || power == 1.0f) return v;
+    if (av < min_rate) return v;  // linear shoulder: no curve below threshold
+    float sign = (v < 0.0f) ? -1.0f : 1.0f;
+    return sign * powf(av, power);
 }
 
 static void apply_stick_delta(uint8_t* axis, float delta_units, int dead_zone_bias) {
@@ -278,8 +296,8 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (g_profile.invert_x) yaw = -yaw;
     if (g_profile.invert_y) pitch = -pitch;
 
-    float delta_x = yaw * g_profile.sensitivity_h;
-    float delta_y = pitch * g_profile.sensitivity_v;
+    float delta_x = signed_pow_curve(yaw, g_profile.curve_power, g_profile.curve_min_rate) * g_profile.sensitivity_h;
+    float delta_y = signed_pow_curve(pitch, g_profile.curve_power, g_profile.curve_min_rate) * g_profile.sensitivity_v;
 
     apply_stick_delta(&pData->rightStick.x, delta_x, g_profile.dead_zone_bias);
     apply_stick_delta(&pData->rightStick.y, delta_y, g_profile.dead_zone_bias);

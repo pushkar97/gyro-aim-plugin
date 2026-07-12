@@ -17,6 +17,16 @@ typedef struct GyroProfile {
                              // gyro contributes non-zero motion, so the game's
                              // own internal stick deadzone doesn't eat it
     int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
+    float curve_power;       // 1.0 = linear, >1.0 = exponential (signed).
+                             // Applied to the corrected gyro rate before
+                             // multiplying by sensitivity, so small
+                             // movements get a smoother ramp-up while
+                             // large flicks still max out.
+    float curve_min_rate;    // rad/s; below this abs(v) the curve is forced
+                             // to pass-through (linear, 1:1 on the already
+                             // drift-corrected value), so tiny residual
+                             // bias ±<0.15 doesn't get exponentially
+                             // amplified into a directional asymmetry.
     bool invert_x;
     bool invert_y;
     bool yaw_from_z;         // true: angularVelocity.z drives horizontal

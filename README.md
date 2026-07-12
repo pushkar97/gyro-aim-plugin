@@ -184,6 +184,7 @@ TriggerThreshold = 250
 InvertX = false
 InvertY = false
 YawFromZ = true
+CurvePower = 2.0
 
 [CUSA00001]
 ; Example: this specific title needs lower sensitivity and gyro disabled

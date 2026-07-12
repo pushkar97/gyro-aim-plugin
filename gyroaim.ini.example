@@ -8,6 +8,8 @@ TriggerThreshold = 250
 InvertX = true
 InvertY = true
 YawFromZ = true
+CurvePower = 2.0
+CurveMinRate = 0.15
 
 ; Example per-title override. Replace CUSA00001 with a real title ID
 ; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).
