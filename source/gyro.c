@@ -170,18 +170,34 @@ static int clamp_int(int v, int lo, int hi) {
 // Values below `min_rate` are passed through linearly (not curved) so
 // tiny residual bias doesn't get exponentially amplified into a
 // directional asymmetry — the curve only kicks in above the threshold.
+// Input is clamped before powf() so a sensor glitch/spike (the DS4 has
+// been observed emitting bad samples in this project before) can't
+// produce an enormous or infinite result that later causes undefined
+// behavior when cast to int.
+#define GYRO_RATE_CLAMP 30.0f  // rad/s; DS4 max spec is far below this
 static float signed_pow_curve(float v, float power, float min_rate) {
     float av = fabsf(v);
     if (v == 0.0f || power <= 0.001f || power == 1.0f) return v;
     if (av < min_rate) return v;  // linear shoulder: no curve below threshold
+    if (av > GYRO_RATE_CLAMP) av = GYRO_RATE_CLAMP;
     float sign = (v < 0.0f) ? -1.0f : 1.0f;
     return sign * powf(av, power);
 }
 
 static void apply_stick_delta(uint8_t* axis, float delta_units, int dead_zone_bias) {
-    if (delta_units == 0.0f) {
+    if (delta_units == 0.0f || isnan(delta_units)) {
         return;
     }
+
+    // The final result is clamped to the -128..127 stick range below
+    // regardless, but clamp the FLOAT here too, before the cast to int:
+    // casting a float that's outside int range (or +/-Inf) to int is
+    // undefined behavior in C, and on x86 can raise an FPU
+    // invalid-operation trap depending on exception-mask state -- a real
+    // crash risk if any upstream math (e.g. the exponential curve) ever
+    // produces an extreme value from a sensor glitch.
+    if (delta_units > 100000.0f) delta_units = 100000.0f;
+    if (delta_units < -100000.0f) delta_units = -100000.0f;
 
     int delta = (int)delta_units;
     if (delta == 0) {
