@@ -36,6 +36,14 @@ typedef struct GyroProfile {
                              // headers (see README's "Known unknowns"); this
                              // is an empirical escape hatch, same idea as
                              // invert_x/invert_y.
+    float yaw_tilt_weight;   // 0.0 = off (default). Blends in a weighted
+                             // contribution from the OTHER horizontal-ish
+                             // axis (the one yaw_from_z did NOT pick) into
+                             // yaw, before dead zone/curve/sensitivity are
+                             // applied. Useful if your natural aiming
+                             // motion is a combined rotation+tilt rather
+                             // than a pure single-axis yaw -- e.g. 0.3-0.5
+                             // adds a noticeable but secondary contribution.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

@@ -8,6 +8,7 @@ TriggerThreshold = 250
 InvertX = true
 InvertY = true
 YawFromZ = true
+YawTiltWeight = 0.3
 CurvePower = 2.0
 CurveMinRate = 0.15
 

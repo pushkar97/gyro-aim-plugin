@@ -66,6 +66,7 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->invert_x = false;
     profile->invert_y = false;
     profile->yaw_from_z = false;
+    profile->yaw_tilt_weight = 0.0f;
     profile->curve_power = 2.0f;
     profile->curve_min_rate = 0.15f;
 }
@@ -83,6 +84,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_bool(table, section, "InvertX", &profile->invert_x);
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
     ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
+    ini_table_get_entry_as_float(table, section, "YawTiltWeight", &profile->yaw_tilt_weight);
     ini_table_get_entry_as_float(table, section, "CurvePower", &profile->curve_power);
     ini_table_get_entry_as_float(table, section, "CurveMinRate", &profile->curve_min_rate);
 }
@@ -303,7 +305,15 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     }
 
     // --- Velocity-based mapping ---------------------------------------
-    float yaw = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
+    // yaw is primarily driven by whichever axis yaw_from_z selects, with
+    // an optional weighted blend of the OTHER axis -- for aiming motions
+    // that are naturally a combined rotation+tilt rather than a pure
+    // single-axis yaw (both axes' bias is already tracked above
+    // regardless of which is "primary", so this is just a sum of two
+    // already-bias-corrected rates).
+    float yaw_primary = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
+    float yaw_secondary = (g_profile.yaw_from_z ? gy : gz) - g_bias[g_profile.yaw_from_z ? 1 : 2];
+    float yaw = yaw_primary + yaw_secondary * g_profile.yaw_tilt_weight;
     float pitch = gx - g_bias[0];
 
     if (fabsf(yaw) < g_profile.dead_zone) yaw = 0.0f;

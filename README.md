@@ -57,7 +57,11 @@ plugin) exist, and they disagree on some details:
   hold/aim the controller, is untested/empirical. `InvertX`/`InvertY` flip
   sign; `YawFromZ` (confirmed needed during real-hardware testing —
   `angularVelocity.z` felt more natural for horizontal than `.y`) switches
-  which axis drives horizontal aim entirely. Pitch (vertical) is currently
+  which axis drives horizontal aim entirely. `YawTiltWeight` (confirmed
+  useful during real-hardware testing — natural aiming motion turned out
+  to be a combined rotation+tilt, not a pure single-axis yaw) blends in a
+  weighted contribution from whichever axis `YawFromZ` did NOT pick,
+  instead of discarding it entirely. Pitch (vertical) is currently
   hardcoded to `.x` — if that also turns out wrong on your setup, the same
   swap pattern applies (flag it and we'll add `PitchFromZ`/similar).
 - **Whether `HOOK_CONTINUE` cleanly calls through to the real
@@ -184,6 +188,7 @@ TriggerThreshold = 250
 InvertX = false
 InvertY = false
 YawFromZ = true
+YawTiltWeight = 0.3
 CurvePower = 2.0
 
 [CUSA00001]
