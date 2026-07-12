@@ -56,6 +56,9 @@ static bool g_recal_armed = true;  // prevents re-trigger until touchpad release
 
 static LightbarState g_lightbar_state = LB_UNSET;
 
+static float g_yaw_filtered = 0.0f;
+static float g_pitch_filtered = 0.0f;
+
 void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->enabled = true;
     profile->sensitivity_h = 40.0f;
@@ -67,6 +70,8 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->invert_y = false;
     profile->yaw_from_z = false;
     profile->yaw_tilt_weight = 0.0f;
+    profile->drift_correction_enabled = true;
+    profile->lowpass_alpha = 1.0f;
     profile->curve_power = 2.0f;
     profile->curve_min_rate = 0.15f;
 }
@@ -85,6 +90,8 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
     ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
     ini_table_get_entry_as_float(table, section, "YawTiltWeight", &profile->yaw_tilt_weight);
+    ini_table_get_entry_as_bool(table, section, "DriftCorrectionEnabled", &profile->drift_correction_enabled);
+    ini_table_get_entry_as_float(table, section, "LowPassAlpha", &profile->lowpass_alpha);
     ini_table_get_entry_as_float(table, section, "CurvePower", &profile->curve_power);
     ini_table_get_entry_as_float(table, section, "CurveMinRate", &profile->curve_min_rate);
 }
@@ -121,6 +128,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_touchpad_hold_count = 0;
     g_recal_armed = true;
     g_lightbar_state = LB_UNSET;
+    g_yaw_filtered = 0.0f;
+    g_pitch_filtered = 0.0f;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -138,6 +147,8 @@ static void start_recalibration(void) {
     memset(g_bias, 0, sizeof(g_bias));
     g_is_stationary = false;
     g_stationary_count = 0;
+    g_yaw_filtered = 0.0f;
+    g_pitch_filtered = 0.0f;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -216,8 +227,13 @@ static void apply_stick_delta(uint8_t* axis, float delta_units, int dead_zone_bi
         }
     }
 
-    int current = (int)(*axis) - STICK_CENTER;  // -128..127
-    int result = clamp_int(current + delta, -128, 127);
+    // Compute the stick position directly from center + delta this frame,
+    // rather than accumulating onto whatever the stick's previous/physical
+    // value was. Each sample's delta is a fresh instantaneous velocity-based
+    // value (no integration), so the output should be too -- reading back
+    // *axis as a base risked the gyro's contribution compounding across
+    // samples instead of representing "this frame's turn rate" cleanly.
+    int result = clamp_int(delta, -128, 127);
     *axis = (uint8_t)clamp_int(result + STICK_CENTER, STICK_MIN, STICK_MAX);
 }
 
@@ -275,26 +291,28 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     }
 
     // --- Continuous drift tracking (only while not actively aiming) ------
-    float ax = pData->acceleration.x;
-    float ay = pData->acceleration.y;
-    float az = pData->acceleration.z;
-    float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
-    bool now_stationary = fabsf(accel_mag - 9.80665f) < STATIONARY_ACCEL_TOLERANCE;
+    if (g_profile.drift_correction_enabled) {
+        float ax = pData->acceleration.x;
+        float ay = pData->acceleration.y;
+        float az = pData->acceleration.z;
+        float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
+        bool now_stationary = fabsf(accel_mag - 9.80665f) < STATIONARY_ACCEL_TOLERANCE;
 
-    if (now_stationary) {
-        if (!g_is_stationary) {
-            g_is_stationary = true;
+        if (now_stationary) {
+            if (!g_is_stationary) {
+                g_is_stationary = true;
+                g_stationary_count = 0;
+            }
+            g_stationary_count++;
+            if (g_stationary_count >= STATIONARY_SAMPLE_COUNT) {
+                g_bias[0] += DRIFT_ALPHA * (gx - g_bias[0]);
+                g_bias[1] += DRIFT_ALPHA * (gy - g_bias[1]);
+                g_bias[2] += DRIFT_ALPHA * (gz - g_bias[2]);
+            }
+        } else {
+            g_is_stationary = false;
             g_stationary_count = 0;
         }
-        g_stationary_count++;
-        if (g_stationary_count >= STATIONARY_SAMPLE_COUNT) {
-            g_bias[0] += DRIFT_ALPHA * (gx - g_bias[0]);
-            g_bias[1] += DRIFT_ALPHA * (gy - g_bias[1]);
-            g_bias[2] += DRIFT_ALPHA * (gz - g_bias[2]);
-        }
-    } else {
-        g_is_stationary = false;
-        g_stationary_count = 0;
     }
 
     // --- Trigger gate ------------------------------------------------------
@@ -315,6 +333,22 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     float yaw_secondary = (g_profile.yaw_from_z ? gy : gz) - g_bias[g_profile.yaw_from_z ? 1 : 2];
     float yaw = yaw_primary + yaw_secondary * g_profile.yaw_tilt_weight;
     float pitch = gx - g_bias[0];
+
+    // Low-pass filter (EMA) on the bias-corrected rate, before dead
+    // zone/curve/sensitivity -- smooths sensor noise. alpha=1.0 (default)
+    // makes this a no-op (filtered value snaps to the raw value every
+    // sample).
+    if (g_profile.lowpass_alpha < 1.0f) {
+        float a = g_profile.lowpass_alpha;
+        if (a < 0.0f) a = 0.0f;
+        g_yaw_filtered += a * (yaw - g_yaw_filtered);
+        g_pitch_filtered += a * (pitch - g_pitch_filtered);
+        yaw = g_yaw_filtered;
+        pitch = g_pitch_filtered;
+    } else {
+        g_yaw_filtered = yaw;
+        g_pitch_filtered = pitch;
+    }
 
     if (fabsf(yaw) < g_profile.dead_zone) yaw = 0.0f;
     if (fabsf(pitch) < g_profile.dead_zone) pitch = 0.0f;

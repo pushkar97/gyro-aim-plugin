@@ -44,6 +44,22 @@ typedef struct GyroProfile {
                              // motion is a combined rotation+tilt rather
                              // than a pure single-axis yaw -- e.g. 0.3-0.5
                              // adds a noticeable but secondary contribution.
+    bool drift_correction_enabled;  // true (default): continuously re-average
+                             // gyro bias while the controller is detected as
+                             // stationary (via accelerometer magnitude), to
+                             // counter slow real-world drift during long aim
+                             // holds. Set false to rely solely on the
+                             // one-time startup/recalibration-hotkey bias
+                             // instead, if continuous correction is ever
+                             // fighting a deliberately-held tilt.
+    float lowpass_alpha;     // 1.0 = no filtering (default, unchanged
+                             // behavior). Exponential moving average
+                             // applied to the bias-corrected yaw/pitch
+                             // rate before dead zone/curve/sensitivity:
+                             // filtered += alpha * (raw - filtered).
+                             // Lower alpha = smoother but more lag; useful
+                             // to reduce sensor-noise jitter at low
+                             // sensitivity/low dead zone settings.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

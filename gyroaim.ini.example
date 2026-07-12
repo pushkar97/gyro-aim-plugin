@@ -11,6 +11,8 @@ YawFromZ = true
 YawTiltWeight = 0.3
 CurvePower = 2.0
 CurveMinRate = 0.15
+DriftCorrectionEnabled = true
+LowPassAlpha = 1.0
 
 ; Example per-title override. Replace CUSA00001 with a real title ID
 ; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).
