@@ -19,6 +19,13 @@ typedef struct GyroProfile {
     int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
     bool invert_x;
     bool invert_y;
+    bool yaw_from_z;         // true: angularVelocity.z drives horizontal
+                             // instead of .y. DS4 gyro axis conventions
+                             // relative to how you physically hold/aim the
+                             // controller aren't verified from public
+                             // headers (see README's "Known unknowns"); this
+                             // is an empirical escape hatch, same idea as
+                             // invert_x/invert_y.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

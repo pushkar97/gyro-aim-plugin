@@ -65,6 +65,7 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->trigger_threshold = 250;
     profile->invert_x = false;
     profile->invert_y = false;
+    profile->yaw_from_z = false;
 }
 
 static void load_section(ini_table_s* table, const char* section, GyroProfile* profile) {
@@ -79,6 +80,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_int(table, section, "TriggerThreshold", &profile->trigger_threshold);
     ini_table_get_entry_as_bool(table, section, "InvertX", &profile->invert_x);
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
+    ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -267,7 +269,7 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     }
 
     // --- Velocity-based mapping ---------------------------------------
-    float yaw = gy - g_bias[1];
+    float yaw = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
     float pitch = gx - g_bias[0];
 
     if (fabsf(yaw) < g_profile.dead_zone) yaw = 0.0f;

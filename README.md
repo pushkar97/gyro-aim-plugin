@@ -51,11 +51,15 @@ plugin) exist, and they disagree on some details:
   doesn't affect the fields we actually read/write (`buttons`, `leftStick`,
   `rightStick`, `analogButtons`, `angularVelocity`, `acceleration`,
   `connected`), which both sources agree on.
-- **Gyro axis sign conventions** — which physical rotation direction
+- **Gyro axis sign/mapping conventions** — which physical rotation direction
   produces a positive vs. negative `angularVelocity.x/y/z` on the DS4, and
-  whether that matches "expected" stick-right/stick-up conventions, is
-  untested. `InvertX`/`InvertY` config options exist as an escape hatch;
-  expect to flip them empirically on first real test.
+  which axis corresponds to "yaw" (horizontal aim) given how you actually
+  hold/aim the controller, is untested/empirical. `InvertX`/`InvertY` flip
+  sign; `YawFromZ` (confirmed needed during real-hardware testing —
+  `angularVelocity.z` felt more natural for horizontal than `.y`) switches
+  which axis drives horizontal aim entirely. Pitch (vertical) is currently
+  hardcoded to `.x` — if that also turns out wrong on your setup, the same
+  swap pattern applies (flag it and we'll add `PitchFromZ`/similar).
 - **Whether `HOOK_CONTINUE` cleanly calls through to the real
   `scePadRead`/`scePadReadState`** — it does not; see "Fixed: crash on game
   launch" below.
@@ -179,6 +183,7 @@ DeadZoneBias = 20
 TriggerThreshold = 250
 InvertX = false
 InvertY = false
+YawFromZ = true
 
 [CUSA00001]
 ; Example: this specific title needs lower sensitivity and gyro disabled
