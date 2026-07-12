@@ -189,6 +189,21 @@ SensitivityV = 25.0
 
 See `gyroaim.ini.example` for a ready-to-copy version of the above.
 
+## Tuning on macOS instead of round-tripping to the console
+
+`gyro.c`/`config.c` are platform-agnostic (all PS4-specific code is isolated
+behind `platform_set_lightbar()`, see `include/platform.h`), so the exact
+same mapping/calibration logic compiles into a standalone macOS SDL3 harness
+at `SDL/examples/input/07-gyro-aim-tuner` (sibling repo). It reads a real DS4
+over USB/Bluetooth, runs the identical `gyro_process_sample()` call the PS4
+hooks use, and renders the resulting stick output live with on-the-fly
+sensitivity/deadzone/bias adjustment (arrow keys, `[`/`]`, `I`/`O`, `R` to
+recalibrate, `S` to print the current values as `.ini` text). L2/L3+R3/
+touchpad hotkeys work identically since they're the same code path. Tune
+there, copy the printed values into `gyroaim.ini`, then do a final
+confidence-check pass on the actual console. See that harness's source
+comments for controls.
+
 ## Project layout
 
 ```

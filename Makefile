@@ -40,7 +40,7 @@ INC_DIR     := include
 
 LIBS := -lSceLibcInternal -lGoldHEN_Hook -lkernel -lSceSysmodule -lScePad
 
-EXTRAFLAGS := $(DEBUG_FLAGS) -D__USE_PRINTF__ -Wall -fcolor-diagnostics
+EXTRAFLAGS := $(DEBUG_FLAGS) -D__USE_PRINTF__ -DPLUGIN_PLATFORM_PS4 -Wall -fcolor-diagnostics
 
 CFILES := $(wildcard $(SRC_DIR)/*.c)
 OBJS   := $(patsubst $(SRC_DIR)/%.c,$(OBJ_DIR)/%.o,$(CFILES))

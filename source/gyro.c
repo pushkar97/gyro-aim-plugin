@@ -23,6 +23,7 @@
 
 #include "gyro_common.h"
 #include "config.h"
+#include "platform.h"
 
 #define CALIB_SAMPLE_COUNT 500        // ~1-2s at typical pad poll rates
 #define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
@@ -114,6 +115,14 @@ void gyro_state_init(const GyroProfile* profile) {
     g_lightbar_state = LB_UNSET;
 }
 
+void gyro_set_profile(const GyroProfile* profile) {
+    g_profile = *profile;
+}
+
+GyroProfile gyro_get_profile(void) {
+    return g_profile;
+}
+
 static void start_recalibration(void) {
     g_calibrated = false;
     g_calib_count = 0;
@@ -129,21 +138,18 @@ static void set_lightbar(int32_t handle, LightbarState state) {
     }
     g_lightbar_state = state;
 
-    ScePadColor color;
-    color.reserve = 0;
     switch (state) {
         case LB_CALIBRATING:
-            color.r = 255; color.g = 200; color.b = 0;   // amber
+            platform_set_lightbar(handle, 255, 200, 0);   // amber
             break;
         case LB_ACTIVE:
-            color.r = 0; color.g = 255; color.b = 0;      // green
+            platform_set_lightbar(handle, 0, 255, 0);      // green
             break;
         case LB_INACTIVE:
         default:
-            color.r = 0; color.g = 60; color.b = 255;     // blue
+            platform_set_lightbar(handle, 0, 60, 255);     // blue
             break;
     }
-    scePadSetLightBar(handle, &color);
 }
 
 static int clamp_int(int v, int lo, int hi) {

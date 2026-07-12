@@ -31,6 +31,14 @@ bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* 
 // One-time global init (call from plugin_load). Sets up calibration state.
 void gyro_state_init(const GyroProfile* profile);
 
+// Updates the active profile's tunable values in place, WITHOUT resetting
+// calibration/drift/hotkey state. Used by live-tuning UIs (see the macOS
+// SDL harness) so adjusting sensitivity mid-session doesn't force a
+// recalibration hold. gyro_state_init() (full reset) is still what
+// recalibration hotkeys/plugin_load use.
+void gyro_set_profile(const GyroProfile* profile);
+GyroProfile gyro_get_profile(void);
+
 // Called from both scePadRead_hook and scePadReadState_hook for every
 // individual ScePadData sample, in order, before it's returned to the game.
 // `handle` is the pad handle (needed for scePadSetLightBar transitions).

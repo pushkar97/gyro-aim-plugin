@@ -1,12 +1,18 @@
-// Minimal common definitions for this plugin (no dependency on the upstream
-// plugin_common.h, which pulls in git_ver.h/Notify OSD helpers we don't use).
-// Logging goes through klog(), declared by the GoldHEN SDK's GoldHEN.h
-// (pulled in transitively via <Common.h>).
+// Minimal common definitions shared between the real PS4 plugin and the
+// macOS SDL tuning harness (see SDL/examples/input/07-gyro-aim-tuner).
+// On PS4 (PLUGIN_PLATFORM_PS4 defined by the plugin's Makefile), logging
+// goes through klog() from the GoldHEN SDK. Off-PS4, it falls back to a
+// plain printf so gyro.c/config.c compile and log unmodified in the harness.
 #pragma once
 
 #include <stdint.h>
 
+#ifdef PLUGIN_PLATFORM_PS4
 #include <Common.h>  // klog() and friends, from the GoldHEN Plugins SDK
+#else
+#include <stdio.h>
+#define klog(...) printf(__VA_ARGS__)
+#endif
 
 typedef uint8_t u8;
 typedef uint16_t u16;
