@@ -57,17 +57,32 @@ plugin) exist, and they disagree on some details:
   untested. `InvertX`/`InvertY` config options exist as an escape hatch;
   expect to flip them empirically on first real test.
 - **Whether `HOOK_CONTINUE` cleanly calls through to the real
-  `scePadRead`/`scePadReadState`** — the reference `gamepad_helper` plugin
-  avoids this specific pattern for these two functions (it instead patches
-  and calls `scePadReadExt`/`scePadReadStateExt` directly, for unrelated
-  reasons — it wanted extension-unit data). This plugin uses the more
-  standard `HOOK_CONTINUE` pattern (as `gamepad_helper` itself does for
-  `scePadSetVibration`). If it misbehaves, falling back to the
-  Ext-function-patch approach from `gamepad_helper` is the documented
-  alternative.
+  `scePadRead`/`scePadReadState`** — it does not; see "Fixed: crash on game
+  launch" below.
 - **`ScePadData.timestamp` units/epoch** — not verified, so calibration and
   drift-correction timing intentionally use sample counts instead of a
   wall-clock duration (see comment at the top of `source/gyro.c`).
+
+## Fixed: crash on game launch (HOOK_CONTINUE)
+
+First real-hardware test crashed every target game immediately on launch.
+Root cause: the initial implementation called through to the real
+`scePadRead`/`scePadReadState` via `HOOK_CONTINUE` (Detour's trampoline call-
+through). `scePadRead`/`scePadReadState` are almost certainly too short/thin
+to safely re-trampoline (likely just a stub jumping straight into a syscall
+handler) — patching a jump into them and then calling back through corrupts
+adjacent code. This is exactly why `gamepad_helper` avoids that specific
+pattern for these two functions (its own doc comments don't say why, but the
+crash makes it obvious in retrospect).
+
+Fix: still hook `scePadRead`/`scePadReadState` with `HOOK32` (installing the
+hook itself is fine — `gamepad_helper` does the same), but the hook bodies no
+longer call through to the original. Instead they call
+`scePadReadExt`/`scePadReadStateExt` directly (separate, unhooked functions
+that return the same data) after neutralizing an internal privilege-check
+guard instruction via a raw byte patch (`Patcher_Install_Patch`, not
+`Detour`) — identical byte patch and offsets to `gamepad_helper`. See
+`source/main.c`.
 
 ## Prerequisites
 

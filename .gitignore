@@ -4,3 +4,10 @@ build/
 *.prx
 *.oelf
 .DS_Store
+
+# Device-side runtime config copies (yours will differ from the repo's
+# gyroaim.ini.example and may contain paths/settings specific to your
+# console); not plugin source, don't commit.
+/gyroaim.ini
+/plugins.ini
+/config.ini

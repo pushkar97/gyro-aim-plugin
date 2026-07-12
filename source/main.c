@@ -1,14 +1,16 @@
 // GoldHEN gyro-aim plugin.
 //
-// Hooks scePadRead/scePadReadState (both, since we don't yet know which
-// entry point any given target game uses) and injects gyro-derived rotation
-// onto the right analog stick while L2 is fully pressed, using the same
-// hooking pattern as the official gamepad_helper example plugin
-// (GoldHEN_Plugins_Repository/plugin_src/gamepad_helper).
-//
-// See gyro.c for the calibration/mapping logic itself; this file is just the
-// scePad hook glue + config/title lookup + plugin lifecycle.
+// Hooks scePadRead/scePadReadState... but NOT by calling through to the
+// original via HOOK_CONTINUE. Those two functions turned out to be too
+// thin/short to safely re-trampoline (this crashed every target game
+// immediately on launch in initial testing) -- exactly why the official
+// gamepad_helper reference plugin avoids that pattern for these specific
+// functions too. Instead, following gamepad_helper's proven approach:
+// scePadReadExt/scePadReadStateExt are called directly (no hook needed on
+// them at all) after neutralizing an internal privilege/lock guard
+// instruction via a raw byte patch (Patcher, not Detour).
 #include <Common.h>
+#include <Patcher.h>
 #include <stdio.h>
 #include <sys/stat.h>
 
@@ -27,13 +29,16 @@ HOOK_INIT(scePadReadState);
 
 #define PLUGIN_CONFIG_PATH GOLDHEN_PATH "/gyroaim.ini"
 
+static Patcher* g_scePadReadExtPatcher;
+static Patcher* g_scePadReadStateExtPatcher;
+
 static bool file_exists(const char* path) {
     struct stat st;
     return stat(path, &st) == 0;
 }
 
 int32_t scePadRead_hook(int32_t handle, ScePadData* pData, int32_t num) {
-    int ret = HOOK_CONTINUE(scePadRead, int (*)(int32_t, ScePadData*, int32_t), handle, pData, num);
+    int ret = scePadReadExt(handle, pData, num);
     if (ret <= 0) {
         return ret;
     }
@@ -44,7 +49,7 @@ int32_t scePadRead_hook(int32_t handle, ScePadData* pData, int32_t num) {
 }
 
 int32_t scePadReadState_hook(int32_t handle, ScePadData* pData) {
-    int ret = HOOK_CONTINUE(scePadReadState, int (*)(int32_t, ScePadData*), handle, pData);
+    int ret = scePadReadStateExt(handle, pData);
     if (ret != 0) {
         return ret;
     }
@@ -61,6 +66,26 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
               "libScePad.sprx");
     int h = 0;
     sys_dynlib_load_prx(module, &h);
+
+    // scePadReadExt/scePadReadStateExt normally refuse to run outside of
+    // libScePad's own privileged caller; the reference gamepad_helper plugin
+    // defeats that check by NOPing the "xor ecx,ecx"/"xor edx,edx" guard
+    // instruction at each function's entry. Same patch, same offsets.
+    g_scePadReadExtPatcher = (Patcher*)malloc(sizeof(Patcher));
+    g_scePadReadStateExtPatcher = (Patcher*)malloc(sizeof(Patcher));
+    Patcher_Construct(g_scePadReadExtPatcher);
+    Patcher_Construct(g_scePadReadStateExtPatcher);
+
+    uint8_t xor_ecx_ecx[5] = { 0x31, 0xC9, 0x90, 0x90, 0x90 };
+    Patcher_Install_Patch(g_scePadReadExtPatcher, (uint64_t)scePadReadExt, xor_ecx_ecx,
+                           sizeof(xor_ecx_ecx));
+
+    uint8_t xor_edx_edx[5] = { 0x31, 0xD2, 0x90, 0x90, 0x90 };
+    Patcher_Install_Patch(g_scePadReadStateExtPatcher, (uint64_t)scePadReadStateExt, xor_edx_edx,
+                           sizeof(xor_edx_edx));
+
+    HOOK32(scePadRead);
+    HOOK32(scePadReadState);
 
     struct proc_info procInfo;
     const char* title_id = "";
@@ -88,9 +113,6 @@ s32 attr_public plugin_load(s32 argc, const char* argv[]) {
 
     gyro_state_init(&profile);
 
-    HOOK32(scePadRead);
-    HOOK32(scePadReadState);
-
     return 0;
 }
 
@@ -98,6 +120,12 @@ s32 attr_public plugin_unload(s32 argc, const char* argv[]) {
     log_info("<%s Ver.0x%08x> %s\n", g_pluginName, g_pluginVersion, __func__);
     UNHOOK(scePadRead);
     UNHOOK(scePadReadState);
+
+    Patcher_Destroy(g_scePadReadExtPatcher);
+    Patcher_Destroy(g_scePadReadStateExtPatcher);
+    free(g_scePadReadExtPatcher);
+    free(g_scePadReadStateExtPatcher);
+
     return 0;
 }
 
@@ -108,3 +136,4 @@ s32 attr_module_hidden module_start(s64 argc, const void* args) {
 s32 attr_module_hidden module_stop(s64 argc, const void* args) {
     return 0;
 }
+
