@@ -54,17 +54,16 @@
 #include "platform.h"
 
 #define CALIB_SAMPLE_COUNT 500        // accepted stationary samples needed
-#define CALIB_GYRO_STILL_THRESHOLD 0.05f  // rad/s; |gx|/|gy|/|gz| must be
+#define CALIB_GYRO_STILL_THRESHOLD 0.10f  // rad/s; |gx|/|gy|/|gz| must be
                                            // below this for a calibration
                                            // sample to be accepted. Must
-                                           // be lenient enough to pass
-                                           // with real DS4 gyro rest noise
-                                           // (not a lab-grade sensor), but
+                                           // be comfortably above the DS4
+                                           // gyro's natural resting bias
+                                           // (~0.05-0.06 rad/s on the Z
+                                           // axis, confirmed by real-
+                                           // hardware observation) but
                                            // tight enough to reject
-                                           // deliberate motion.
-                                           // Matched to the drift-
-                                           // correction threshold for
-                                           // consistency.
+                                           // deliberate motion (~0.2+).
 #define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
 #define DRIFT_ALPHA 0.01f
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
