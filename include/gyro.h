@@ -114,6 +114,17 @@ void gyro_state_init(const GyroProfile* profile);
 void gyro_set_profile(const GyroProfile* profile);
 GyroProfile gyro_get_profile(void);
 
+// Debug state snapshot, updated every gyro_process_sample() call for
+// diagnostic rendering (used by the Mac tuner HUD).
+typedef struct GyroDebug {
+    float gyro[3];    // raw gx, gy, gz
+    float bias[3];    // current bias[0], bias[1], bias[2]
+    float yaw;        // post-bias, post-deadzone, post-invert yaw
+    float pitch;      // post-bias, post-deadzone, post-invert pitch
+} GyroDebug;
+
+GyroDebug gyro_get_debug(void);
+
 // Called from both scePadRead_hook and scePadReadState_hook for every
 // individual ScePadData sample, in order, before it's returned to the game.
 // `handle` is the pad handle (needed for scePadSetLightBar transitions).

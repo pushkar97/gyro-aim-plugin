@@ -107,6 +107,8 @@ static bool g_recal_armed = true;
 
 static LightbarState g_lightbar_state = LB_UNSET;
 
+static GyroDebug g_debug;
+
 static float g_float_stick_x = 0.0f;
 static float g_float_stick_y = 0.0f;
 
@@ -260,6 +262,10 @@ void gyro_set_profile(const GyroProfile* profile) {
 
 GyroProfile gyro_get_profile(void) {
     return g_profile;
+}
+
+GyroDebug gyro_get_debug(void) {
+    return g_debug;
 }
 
 static void start_recalibration(void) {
@@ -427,6 +433,13 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (isnan(gy) || isinf(gy)) gy = 0.0f;
     if (isnan(gz) || isinf(gz)) gz = 0.0f;
 
+    g_debug.gyro[0] = gx;
+    g_debug.gyro[1] = gy;
+    g_debug.gyro[2] = gz;
+    g_debug.bias[0] = g_bias[0];
+    g_debug.bias[1] = g_bias[1];
+    g_debug.bias[2] = g_bias[2];
+
     // --- Calibration -----------------------------------------------------
     // Accumulates every sample unconditionally — no stationary check.
     // The "reject moving samples" approach (task 2 of the refinement
@@ -501,6 +514,9 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
 
     if (g_profile.invert_x) yaw = -yaw;
     if (g_profile.invert_y) pitch = -pitch;
+
+    g_debug.yaw = yaw;
+    g_debug.pitch = pitch;
 
     float stick_x = process_axis(yaw, &g_float_stick_x,
                                   g_profile.gain_rates_h, g_profile.gain_values_h,
