@@ -26,8 +26,11 @@ before relying on this.
   (`LowPassAlpha`) or exponentially damped toward zero while the gyro is
   inside the dead zone (`DampingFactor`) — the two never run in the same
   sample, so they never compound — and finally soft-saturated via `tanhf`
-  (`SaturationKnee`) before the one-time conversion to the integer stick
-  report value. See the sibling `SDL/` gyro visualizer experiment and this
+  (`SaturationKnee`). This saturated gyro contribution is then **summed
+  onto whatever the physical right stick is already reporting**, not used
+  to replace it — so nudging the physical stick while gyro-aiming adds to
+  the gyro's contribution rather than being silently discarded — before
+  the final hard clamp and conversion to the integer stick report value. See the sibling `SDL/` gyro visualizer experiment and this
   README's git history for earlier approaches that were replaced by this
   design (delta-based cumulative/non-cumulative stick writes, an
   exponential curve on the gyro rate itself, EMA on the gyro rate instead
@@ -93,12 +96,25 @@ plugin) exist, and they disagree on some details:
 The gain-curve/EMA/damping/soft-saturation model described above replaced
 two earlier approaches (see git history for full detail):
 
-1. **Delta-based, then non-cumulative stick writes.** The original model
-   wrote `current_stick_value + delta` each sample (summing with whatever
-   the stick already held); a later revision changed this to
-   `center + delta` (overwriting, not summing) once summing turned out to
-   make the gyro's contribution depend on stale prior state rather than
-   representing "this frame's turn rate" cleanly.
+1. **Delta-based, then non-cumulative stick writes, then summed-with-
+   physical-stick again.** The very first model summed the gyro's
+   contribution onto whatever the stick's *previous* value already was
+   (`current_stick_value + delta`) every sample — this conflated two
+   different things: the gyro's own contribution compounding across
+   samples (undesirable — it should represent "this frame's turn rate",
+   not an accumulated history), and summing with the *physical* stick
+   (desirable — nudging the stick while gyro-aiming should add to the
+   aim, not be silently discarded). A later revision fixed the first
+   problem by writing `center + delta` instead, but that also fixed the
+   second problem in the wrong direction: since the gain-curve rewrite's
+   `write_stick_uint8()` never read `*axis` at all, gyro-aiming ended up
+   **completely overwriting** physical stick input while L2 was held — a
+   real regression, caught by testing on real hardware. The current
+   `write_stick_uint8()` separates the two concerns correctly: the gyro
+   side (gain curve → EMA/damping → soft saturation) never reads back its
+   own previous OUTPUT as a base (no compounding), but the final result
+   is summed onto the physical stick's *current* reading before the hard
+   clamp — restoring "nudge the stick while gyro-aiming adds to the aim".
 2. **Exponential curve on the gyro rate + EMA on the gyro rate.** Both
    applied *before* the rate was multiplied by a flat sensitivity value.
    This is what the gain curve (task 1) and output-EMA (task 2) in the

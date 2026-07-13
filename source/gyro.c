@@ -13,7 +13,9 @@
 //                      the same sample, so their effects never compound.]
 //     -> soft saturation [tanhf(float_stick / knee) * 128, replacing a
 //                      hard clamp with a smooth asymptote]
-//     -> uint8 stick value
+//     -> SUMMED onto the physical stick's current position (not a
+//                      replacement -- see write_stick_uint8) -> uint8
+//                      stick value, hard-clamped to the valid range
 //
 // float_stick resets to 0 whenever aiming stops (L2 released, gyro
 // runtime-disabled, or profile disabled) as well as on calibration/
@@ -316,7 +318,14 @@ static float process_axis(float rate, float* float_stick,
 
 // Converts the final float_stick value (signed stick-units, nominally
 // within about -128..128) to a uint8_t pad report value, applying soft
-// saturation and an optional dead-zone-bias floor.
+// saturation and an optional dead-zone-bias floor, then SUMS it onto
+// whatever the physical stick's current position already is (read from
+// *axis, which holds the raw hardware reading at this point) rather than
+// overwriting it -- so gyro contributes ON TOP OF physical stick input
+// instead of replacing it while aiming. Soft saturation is applied to the
+// gyro component alone (the physical stick is already hardware-bounded to
+// -128..127, no need to saturate that separately); the final combined sum
+// is hard-clamped to the valid stick range.
 static void write_stick_uint8(uint8_t* axis, float stick, float knee, int dbias) {
     float sat = tanhf(stick / knee) * 128.0f;
     if (stick != 0.0f && dbias > 0) {
@@ -326,8 +335,9 @@ static void write_stick_uint8(uint8_t* axis, float stick, float knee, int dbias)
             sat = (sat < 0.0f) ? (float)(-dbias) : (float)dbias;
         }
     }
-    int val = clamp_int((int)sat, -128, 127) + STICK_CENTER;
-    *axis = (uint8_t)clamp_int(val, STICK_MIN, STICK_MAX);
+    int phys = (int)(*axis) - STICK_CENTER;  // current physical stick position, signed
+    int combined = clamp_int(phys + (int)sat, -128, 127);
+    *axis = (uint8_t)clamp_int(combined + STICK_CENTER, STICK_MIN, STICK_MAX);
 }
 
 void gyro_process_sample(int32_t handle, ScePadData* pData) {
