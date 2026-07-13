@@ -7,26 +7,57 @@
 
 #include "pad.h"
 
+#define MAX_GAIN_POINTS 8
+
 // Per-title (or [default]) config, loaded once at plugin_load.
 typedef struct GyroProfile {
     bool enabled;
-    float sensitivity_h;    // stick units per rad/s, yaw -> stick X
-    float sensitivity_v;    // stick units per rad/s, pitch -> stick Y
     float dead_zone;        // rad/s; |corrected gyro| below this is treated as 0
     int dead_zone_bias;     // stick units (0-127); minimum push applied when
                              // gyro contributes non-zero motion, so the game's
-                             // own internal stick deadzone doesn't eat it
+                             // own internal stick deadzone doesn't eat it.
+                             // Defaults to 0 -- the gain curve's boosted
+                             // low-end response should make this unnecessary
+                             // in most cases; it remains available as
+                             // optional fine-tuning only.
     int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
-    float curve_power;       // 1.0 = linear, >1.0 = exponential (signed).
-                             // Applied to the corrected gyro rate before
-                             // multiplying by sensitivity, so small
-                             // movements get a smoother ramp-up while
-                             // large flicks still max out.
-    float curve_min_rate;    // rad/s; below this abs(v) the curve is forced
-                             // to pass-through (linear, 1:1 on the already
-                             // drift-corrected value), so tiny residual
-                             // bias ±<0.15 doesn't get exponentially
-                             // amplified into a directional asymmetry.
+
+    // Gain curve: stick_raw = rate * gain(|rate|), where gain() linearly
+    // interpolates between (rate, gain) breakpoints. Below the first
+    // breakpoint the first gain applies; above the last, the last gain.
+    // Rates must be ascending. Independently configurable per axis (H =
+    // yaw/horizontal, V = pitch/vertical) so their response curves can
+    // evolve separately.
+    float gain_rates_h[MAX_GAIN_POINTS];
+    float gain_values_h[MAX_GAIN_POINTS];
+    int gain_count_h;
+    float gain_rates_v[MAX_GAIN_POINTS];
+    float gain_values_v[MAX_GAIN_POINTS];
+    int gain_count_v;
+
+    float lowpass_alpha;    // EMA on the mapped STICK OUTPUT (not the gyro
+                             // input), applied while actively moving:
+                             // float_stick += alpha * (raw - float_stick).
+                             // 1.0 = no smoothing (snaps to raw each
+                             // sample); lower = smoother but more lag.
+                             // Mutually exclusive with damping_factor: this
+                             // runs only while the rate is non-zero
+                             // (outside the dead zone); damping runs only
+                             // when the rate is exactly zero (inside it).
+                             // They never compound.
+    float damping_factor;   // Per-sample decay multiplier applied to
+                             // float_stick ONLY while the corrected rate is
+                             // exactly zero (inside the dead zone), so the
+                             // stick eases back to center over a few
+                             // samples instead of snapping instantly.
+                             // 1.0 = no damping (instant snap to 0).
+    float saturation_knee;  // Soft-saturation knee for
+                             // tanhf(float_stick / knee) * 128 before the
+                             // final integer conversion, replacing a hard
+                             // clamp with a smooth asymptote. Smaller knee
+                             // = earlier/softer rolloff before hitting the
+                             // physical stick's max deflection.
+
     bool invert_x;
     bool invert_y;
     bool yaw_from_z;         // true: angularVelocity.z drives horizontal
@@ -39,7 +70,7 @@ typedef struct GyroProfile {
     float yaw_tilt_weight;   // 0.0 = off (default). Blends in a weighted
                              // contribution from the OTHER horizontal-ish
                              // axis (the one yaw_from_z did NOT pick) into
-                             // yaw, before dead zone/curve/sensitivity are
+                             // yaw, before dead zone/gain-curve are
                              // applied. Useful if your natural aiming
                              // motion is a combined rotation+tilt rather
                              // than a pure single-axis yaw -- e.g. 0.3-0.5
@@ -52,14 +83,6 @@ typedef struct GyroProfile {
                              // one-time startup/recalibration-hotkey bias
                              // instead, if continuous correction is ever
                              // fighting a deliberately-held tilt.
-    float lowpass_alpha;     // 1.0 = no filtering (default, unchanged
-                             // behavior). Exponential moving average
-                             // applied to the bias-corrected yaw/pitch
-                             // rate before dead zone/curve/sensitivity:
-                             // filtered += alpha * (raw - filtered).
-                             // Lower alpha = smoother but more lag; useful
-                             // to reduce sensor-noise jitter at low
-                             // sensitivity/low dead zone settings.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

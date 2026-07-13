@@ -17,23 +17,32 @@ before relying on this.
 - Hooks both `scePadRead` (buffered) and `scePadReadState` (single latest),
   since it's not yet known which entry point any given target game uses.
 - Gyro rotation is mapped as a **velocity**, not integrated into an absolute
-  position: each sample, `(gyro_rate - bias) * sensitivity` is written
-  directly as the right stick's X/Y deflection (center + delta, not added
-  onto the previous stick value — see "Stick write is non-cumulative"
-  below), then clamped. This mirrors how native gyro-aim implementations
-  (e.g. Splatoon, JoyShockMapper) work, and avoids the drift-accumulation/
-  NaN-propagation issues integration-based approaches run into (see the
-  sibling `SDL/` gyro visualizer experiment for a worked example of exactly
-  those bugs).
+  position. Each sample goes through a configurable **gain curve** (rate
+  breakpoints × gain values, linearly interpolated between them, independent
+  per axis) that gives tiny movements a much bigger multiplier than large
+  flicks — the goal being small aim adjustments are easy to make precisely
+  while big flicks don't overshoot. The gained value then feeds a
+  floating-point stick state that's EMA-smoothed while actively moving
+  (`LowPassAlpha`) or exponentially damped toward zero while the gyro is
+  inside the dead zone (`DampingFactor`) — the two never run in the same
+  sample, so they never compound — and finally soft-saturated via `tanhf`
+  (`SaturationKnee`) before the one-time conversion to the integer stick
+  report value. See the sibling `SDL/` gyro visualizer experiment and this
+  README's git history for earlier approaches that were replaced by this
+  design (delta-based cumulative/non-cumulative stick writes, an
+  exponential curve on the gyro rate itself, EMA on the gyro rate instead
+  of the stick output).
 - Gyro only contributes while L2 is fully pressed (`analogButtons.l2 >=
   TriggerThreshold`, default 250/255).
 - One-time startup calibration (first ~500 samples) plus continuous
   stillness-based drift correction (via accelerometer magnitude ≈ 9.80665,
   toggle with `DriftCorrectionEnabled`) keep the camera from creeping
   during long aim holds.
-- Optional low-pass filter (`LowPassAlpha`, default `1.0`/off) smooths
-  sensor noise on the bias-corrected rate before dead zone/curve/
-  sensitivity are applied.
+- The floating-point stick state resets to 0 whenever aiming stops — L2
+  released, gyro runtime-disabled (L3+R3), or the profile disabled — as
+  well as on calibration/recalibration. Without this, resuming aiming
+  after a pause would partially blend in a stale value from before the
+  pause via the EMA's weighted carryover.
 - L3+R3 toggles gyro on/off at runtime (for vehicle sections, menus, etc. —
   see the config section below for per-title profiles as the primary
   mechanism, this hotkey is the manual escape hatch).
@@ -79,20 +88,32 @@ plugin) exist, and they disagree on some details:
 
 ## Fixed: crash on game launch (HOOK_CONTINUE)
 
-## Stick write is non-cumulative
+## Response model history
 
-`apply_stick_delta()` writes `center + delta` each sample, not
-`current_stick_value + delta`. Earlier this read back and added onto
-whatever the stick's previous/physical value was (matching the original
-"sum gyro with physical stick input, then clamp" design decision from
-initial planning). In practice this meant gyro's contribution to a given
-sample was based on whatever the stick already held, which isn't the same
-thing as "this frame's turn rate" — the non-cumulative version is more
-predictable and matches the velocity-based (no integration) model used
-everywhere else in this plugin. Net effect: while gyro is contributing
-(non-zero delta), it now fully determines that axis's stick value for that
-sample rather than adding to physical stick input; when gyro delta is
-exactly zero, physical stick input passes through untouched.
+The gain-curve/EMA/damping/soft-saturation model described above replaced
+two earlier approaches (see git history for full detail):
+
+1. **Delta-based, then non-cumulative stick writes.** The original model
+   wrote `current_stick_value + delta` each sample (summing with whatever
+   the stick already held); a later revision changed this to
+   `center + delta` (overwriting, not summing) once summing turned out to
+   make the gyro's contribution depend on stale prior state rather than
+   representing "this frame's turn rate" cleanly.
+2. **Exponential curve on the gyro rate + EMA on the gyro rate.** Both
+   applied *before* the rate was multiplied by a flat sensitivity value.
+   This is what the gain curve (task 1) and output-EMA (task 2) in the
+   current model specifically replaced — see `gyro_subagent_instructions.md`
+   (if still present) for the original task breakdown. The exponential
+   curve in particular suppressed small movements (exactly the opposite of
+   what a gain-curve-based response, which boosts small movements, is
+   meant to do) and needed a defensive float-to-int clamp to avoid a real
+   crash from a `powf()`-amplified sensor glitch. The current model's
+   `tanhf`-based soft saturation is bounded by construction for any finite
+   input, making that defensive clamp unnecessary.
+
+Both the persistent floating-point stick state (`process_axis()`/
+`write_stick_uint8()` in `source/gyro.c`) and the reset-on-L2-release
+behavior described above are current, not historical.
 
 First real-hardware test crashed every target game immediately on launch.
 Root cause: the initial implementation called through to the real
@@ -201,25 +222,30 @@ titles could flag it.
 ```ini
 [default]
 Enabled = true
-SensitivityH = 40.0
-SensitivityV = 40.0
 DeadZone = 0.02
-DeadZoneBias = 20
+DeadZoneBias = 0
 TriggerThreshold = 250
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 90 70 50 35 25
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 90 70 50 35 25
+LowPassAlpha = 0.5
+DampingFactor = 0.88
+SaturationKnee = 100.0
 InvertX = false
 InvertY = false
 YawFromZ = true
 YawTiltWeight = 0.3
-CurvePower = 2.0
-CurveMinRate = 0.15
 DriftCorrectionEnabled = true
-LowPassAlpha = 1.0
 
 [CUSA00001]
-; Example: this specific title needs lower sensitivity and gyro disabled
-; while driving is handled manually via the L3+R3 toggle hotkey, not here.
-SensitivityH = 25.0
-SensitivityV = 25.0
+; Example: lower gain values for a title that needs less amplification,
+; and gyro disabled while driving is handled manually via the L3+R3 toggle
+; hotkey, not here.
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 80 55 40 30 20
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 80 55 40 30 20
 ```
 
 See `gyroaim.ini.example` for a ready-to-copy version of the above.
@@ -228,16 +254,17 @@ See `gyroaim.ini.example` for a ready-to-copy version of the above.
 
 `gyro.c`/`config.c` are platform-agnostic (all PS4-specific code is isolated
 behind `platform_set_lightbar()`, see `include/platform.h`), so the exact
-same mapping/calibration logic compiles into a standalone macOS SDL3 harness
-at `SDL/examples/input/07-gyro-aim-tuner` (sibling repo). It reads a real DS4
+same response-model logic compiles into a standalone macOS SDL3 harness at
+`SDL/examples/input/07-gyro-aim-tuner` (sibling repo). It reads a real DS4
 over USB/Bluetooth, runs the identical `gyro_process_sample()` call the PS4
 hooks use, and renders the resulting stick output live with on-the-fly
-sensitivity/deadzone/bias adjustment (arrow keys, `[`/`]`, `I`/`O`, `R` to
-recalibrate, `S` to print the current values as `.ini` text). L2/L3+R3/
-touchpad hotkeys work identically since they're the same code path. Tune
-there, copy the printed values into `gyroaim.ini`, then do a final
-confidence-check pass on the actual console. See that harness's source
-comments for controls.
+adjustment of dead zone, dead-zone bias, damping, saturation knee,
+low-pass alpha, and axis-mapping options (see the harness source's top
+comment for the full control list — gain curves themselves are edited in
+the `.ini` file, not live; `S` prints the current full profile, including
+gain curves, as `.ini` text). L2/L3+R3/touchpad hotkeys work identically
+since they're the same code path. Tune there, copy the printed values into
+`gyroaim.ini`, then do a final confidence-check pass on the actual console.
 
 ## Project layout
 
