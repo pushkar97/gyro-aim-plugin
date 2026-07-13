@@ -54,16 +54,6 @@
 #include "platform.h"
 
 #define CALIB_SAMPLE_COUNT 500        // accepted stationary samples needed
-#define CALIB_GYRO_STILL_THRESHOLD 0.10f  // rad/s; |gx|/|gy|/|gz| must be
-                                           // below this for a calibration
-                                           // sample to be accepted. Must
-                                           // be comfortably above the DS4
-                                           // gyro's natural resting bias
-                                           // (~0.05-0.06 rad/s on the Z
-                                           // axis, confirmed by real-
-                                           // hardware observation) but
-                                           // tight enough to reject
-                                           // deliberate motion (~0.2+).
 #define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
 #define DRIFT_ALPHA 0.01f
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
@@ -306,30 +296,6 @@ static int clamp_int(int v, int lo, int hi) {
 
 // Task 2: check whether the controller is genuinely stationary (both accel
 // and gyro) for calibration-sample admission.
-static bool calibration_sample_is_stationary(float gx, float gy, float gz,
-                                              float ax, float ay, float az) {
-    float accel_mag_sq = ax * ax + ay * ay + az * az;
-    // If the accelerometer is returning near-zero (not providing data
-    // at all on this firmware / SDK version), skip the accel check and
-    // rely solely on gyro stillness below. A zero accel reading is NOT
-    // valid stationary data — it's just no data — and would otherwise
-    // fail < STATIONARY_ACCEL_LOW_SQ every time, blocking calibration
-    // indefinitely.
-    if (accel_mag_sq > 1.0f) {
-        if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
-            return false;
-        }
-    }
-    if (fabsf(gx) >= CALIB_GYRO_STILL_THRESHOLD ||
-        fabsf(gy) >= CALIB_GYRO_STILL_THRESHOLD ||
-        fabsf(gz) >= CALIB_GYRO_STILL_THRESHOLD) {
-        return false;
-    }
-    return true;
-}
-
-// Task 3: extended drift-correction stationary check — requires both accel
-// AND gyro to be still.
 static bool drift_sample_is_stationary(float gx, float gy, float gz,
                                         float ax, float ay, float az) {
     float accel_mag_sq = ax * ax + ay * ay + az * az;
@@ -454,25 +420,29 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (isnan(gy) || isinf(gy)) gy = 0.0f;
     if (isnan(gz) || isinf(gz)) gz = 0.0f;
 
-    // --- Calibration (task 2: only accept stationary samples) -------------
+    // --- Calibration -----------------------------------------------------
+    // Accumulates every sample unconditionally — no stationary check.
+    // The "reject moving samples" approach (task 2 of the refinement
+    // plan) introduced two independent failure points (accel data being
+    // zero on some PS4 firmware variants, and a gyro threshold that must
+    // clear the DS4's natural resting bias of ~0.05 rad/s on the Z axis)
+    // that together prevented calibration from ever completing on real
+    // hardware. The original unconditional approach is simpler, known to
+    // work, and produces an accurate bias over CALIB_SAMPLE_COUNT
+    // samples even if a few are collected while moving.
     if (!g_calibrated) {
         set_lightbar(handle, LB_CALIBRATING);
-        float ax = pData->acceleration.x;
-        float ay = pData->acceleration.y;
-        float az = pData->acceleration.z;
-        if (calibration_sample_is_stationary(gx, gy, gz, ax, ay, az)) {
-            g_calib_sum[0] += gx;
-            g_calib_sum[1] += gy;
-            g_calib_sum[2] += gz;
-            g_calib_count++;
-            if (g_calib_count >= CALIB_SAMPLE_COUNT) {
-                g_bias[0] = g_calib_sum[0] / (float)g_calib_count;
-                g_bias[1] = g_calib_sum[1] / (float)g_calib_count;
-                g_bias[2] = g_calib_sum[2] / (float)g_calib_count;
-                g_calibrated = true;
-                log_info("gyro calibration complete: %d accepted samples, bias=[%f %f %f]\n",
-                         g_calib_count, g_bias[0], g_bias[1], g_bias[2]);
-            }
+        g_calib_sum[0] += gx;
+        g_calib_sum[1] += gy;
+        g_calib_sum[2] += gz;
+        g_calib_count++;
+        if (g_calib_count >= CALIB_SAMPLE_COUNT) {
+            g_bias[0] = g_calib_sum[0] / (float)g_calib_count;
+            g_bias[1] = g_calib_sum[1] / (float)g_calib_count;
+            g_bias[2] = g_calib_sum[2] / (float)g_calib_count;
+            g_calibrated = true;
+            log_info("gyro calibration complete: bias=[%f %f %f]\n",
+                     g_bias[0], g_bias[1], g_bias[2]);
         }
         return;
     }
