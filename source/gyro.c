@@ -54,12 +54,19 @@
 #include "platform.h"
 
 #define CALIB_SAMPLE_COUNT 500        // accepted stationary samples needed
-#define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
-#define DRIFT_ALPHA 0.01f
+#define STATIONARY_SAMPLE_COUNT 100   // consecutive still samples before drift EMA kicks in
+#define DRIFT_ALPHA 0.03f              // fraction blended toward observed bias each sample
+                                        // (raised from 0.01 for faster self-correction)
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
-#define STATIONARY_GYRO_THRESHOLD 0.05f  // rad/s; all gyro axes must be below
-                                          // this for drift-correction to
-                                          // consider the controller stationary
+#define STATIONARY_GYRO_THRESHOLD 0.10f  // rad/s; all gyro axes must be below
+                                           // this for drift-correction to
+                                           // consider the controller
+                                           // stationary. Raised from 0.05
+                                           // because the DS4's Z-axis has a
+                                           // confirmed ~0.05 rad/s resting
+                                           // bias, which would always fail
+                                           // the check and prevent drift
+                                           // correction from ever running.
 // Squared accel bounds — avoids a sqrtf() call on every sample (see below).
 #define STATIONARY_ACCEL_LOW_SQ \
     ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
