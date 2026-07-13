@@ -3,14 +3,15 @@
 //
 // Response model pipeline (per axis, H=yaw/horizontal, V=pitch/vertical):
 //
-//   gyro rate (bias-corrected, dead-zoned, inverted)
+//   gyro rate (bias-corrected, dead-zoned with hysteresis, inverted)
 //     -> gain curve   [stick_raw = rate * gain(|rate|), per-axis, linearly
 //                      interpolated lookup table]
 //     -> EMA or damping, mutually exclusive [float_stick persists across
 //                      samples: EMA blends toward stick_raw while actively
-//                      moving; damping decays float_stick toward 0 while
-//                      the rate is inside the dead zone. They never run in
-//                      the same sample, so their effects never compound.]
+//                      moving; interpolation-based damping eases toward 0
+//                      while the rate is inside the dead zone. They never
+//                      run in the same sample, so their effects never
+//                      compound.]
 //     -> soft saturation [tanhf(float_stick / knee) * 128, replacing a
 //                      hard clamp with a smooth asymptote]
 //     -> SUMMED onto the physical stick's current position (not a
@@ -40,12 +41,7 @@
 // - Crash-safety: gx/gy/gz are NaN/Inf-filtered to 0.0 immediately on
 //   read (below), and tanhf() in the final saturation step bounds its
 //   output to a finite range for any finite input. Combined, this makes a
-//   dedicated extra clamp before the final float-to-int cast unnecessary
-//   (an earlier, now-superseded response model's exponential curve could
-//   produce huge/non-finite intermediate values from a sensor glitch and
-//   needed such a clamp; the gain curve here is bounded by construction --
-//   gain() returns at most the largest configured breakpoint value, so
-//   stick_raw stays proportional to the (already-finite) rate).
+//   dedicated extra clamp before the final float-to-int cast unnecessary.
 #include "gyro.h"
 
 #include <math.h>
@@ -57,60 +53,69 @@
 #include "config.h"
 #include "platform.h"
 
-#define CALIB_SAMPLE_COUNT 500        // ~1-2s at typical pad poll rates
+#define CALIB_SAMPLE_COUNT 500        // accepted stationary samples needed
+#define CALIB_GYRO_STILL_THRESHOLD 0.01f  // rad/s; |gx|/|gy|/|gz| must be
+                                           // below this for a calibration
+                                           // sample to be accepted
 #define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
 #define DRIFT_ALPHA 0.01f
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
-// Squared bounds for the stationary check below, avoiding a sqrtf() call
-// on every sample (this block runs unconditionally once calibrated,
-// regardless of whether the player is aiming, making it the single most
-// frequently-executed transcendental-function call site in this file
-// before this change). sqrt is monotonic for non-negative inputs, so
-// "sqrt(x) in [lo, hi]" <=> "x in [lo^2, hi^2]" for lo, hi >= 0 -- these
-// are compile-time constants (simple literal arithmetic, folded
-// regardless of optimization level), so this is a pure win with no
-// change in behavior.
+#define STATIONARY_GYRO_THRESHOLD 0.05f  // rad/s; all gyro axes must be below
+                                          // this for drift-correction to
+                                          // consider the controller stationary
+// Squared accel bounds — avoids a sqrtf() call on every sample (see below).
 #define STATIONARY_ACCEL_LOW_SQ \
     ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
 #define STATIONARY_ACCEL_HIGH_SQ \
     ((9.80665f + STATIONARY_ACCEL_TOLERANCE) * (9.80665f + STATIONARY_ACCEL_TOLERANCE))
+
 #define STICK_CENTER 128
 #define STICK_MIN 0
 #define STICK_MAX 255
 
+// Dead-zone hysteresis (task 6): enter at a lower threshold, exit at a
+// higher one, so the dead-zone boundary is a band rather than a hard line.
+// Both are expressed as fractions of the configured dead_zone value so a
+// single DeadZone config key still controls the overall feel.
+#define DEADZONE_ENTER_FRAC 0.9f   // 0.9 * dead_zone = 0.018 (for default 0.02)
+#define DEADZONE_EXIT_FRAC 1.2f    // 1.2 * dead_zone = 0.024
+
 // L3+R3 toggle and touchpad-hold recalibrate hotkeys.
-#define RECALIBRATE_HOLD_SAMPLES 150  // consecutive touchpad-held samples to trigger
+#define RECALIBRATE_HOLD_SAMPLES 150
 
 typedef enum LightbarState { LB_UNSET = -1, LB_INACTIVE, LB_ACTIVE, LB_CALIBRATING } LightbarState;
 
 static GyroProfile g_profile;
 
 static bool g_calibrated = false;
-static int g_calib_count = 0;
+static int g_calib_count = 0;          // accepted (stationary) samples
 static float g_calib_sum[3] = { 0, 0, 0 };
 static float g_bias[3] = { 0, 0, 0 };
 
 static bool g_is_stationary = false;
 static int g_stationary_count = 0;
 
-static bool g_runtime_enabled = true;   // toggled by L3+R3
+static bool g_runtime_enabled = true;
 static bool g_prev_l3r3_held = false;
 
 static int g_touchpad_hold_count = 0;
-static bool g_recal_armed = true;  // prevents re-trigger until touchpad released
+static bool g_recal_armed = true;
 
 static LightbarState g_lightbar_state = LB_UNSET;
 
-// Per-axis floating-point stick state, persisted across samples for the
-// EMA/damping stages. Reset to 0 whenever aiming stops (see
-// gyro_process_sample) or on calibration/recalibration.
 static float g_float_stick_x = 0.0f;
 static float g_float_stick_y = 0.0f;
 
-// Gain curves are shared between H and V by default but independently
-// configurable per axis (see gyroaim.ini / load_section).
+// Dead-zone hysteresis state (task 6): track whether each axis is
+// currently inside the dead zone so we can apply different enter/exit
+// thresholds. Reset on calibration.
+static bool g_yaw_in_dz = false;
+static bool g_pitch_in_dz = false;
+
+// Default gain curve. Tuned down from the previous extremely aggressive
+// first breakpoint (200→140) per task 5.
 static const float kDefaultGainRates[] = { 0.02f, 0.05f, 0.15f, 0.40f, 1.00f, 100.0f };
-static const float kDefaultGainValues[] = { 200.0f, 90.0f, 70.0f, 50.0f, 35.0f, 25.0f };
+static const float kDefaultGainValues[] = { 140.0f, 100.0f, 70.0f, 50.0f, 35.0f, 25.0f };
 #define DEFAULT_GAIN_COUNT 6
 
 static void set_default_gain(float* rates, float* values, int* count) {
@@ -122,30 +127,14 @@ static void set_default_gain(float* rates, float* values, int* count) {
 void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->enabled = true;
     profile->dead_zone = 0.02f;
-    profile->dead_zone_bias = 20;  // The original response-model plan
-                                   // (task 5) assumed the gain curve's
-                                   // boosted low-end response would make
-                                   // this unnecessary at 0. Real-hardware
-                                   // testing showed otherwise: at the low
-                                   // end (rate just above DeadZone), the
-                                   // gain curve alone only produces ~2-10
-                                   // stick units out of 128 -- well below
-                                   // the ~10-20% internal deadzone most
-                                   // games apply to their OWN stick
-                                   // reading before it does anything. That
-                                   // deadzone is invisible to this plugin
-                                   // (and to the Mac tuner, which shows
-                                   // the raw rightStick value with no
-                                   // game-side deadzone in the way) --
-                                   // small gyro movements were being
-                                   // silently swallowed downstream. 20
-                                   // restores the previously-validated
-                                   // floor.
+    profile->dead_zone_bias = 20;
     profile->trigger_threshold = 250;
     set_default_gain(profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h);
     set_default_gain(profile->gain_rates_v, profile->gain_values_v, &profile->gain_count_v);
     profile->lowpass_alpha = 0.5f;
-    profile->damping_factor = 0.88f;
+    // Task 1: damping is now interpolation-based (fraction moved toward
+    // zero per sample, not a multiplier). 0.12 ≈ the old *= 0.88 feel.
+    profile->damping_factor = 0.12f;
     profile->saturation_knee = 100.0f;
     profile->invert_x = false;
     profile->invert_y = false;
@@ -154,8 +143,6 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->drift_correction_enabled = true;
 }
 
-// Parses a space-separated list of floats from `str` into `out` (max
-// `max_count` entries). Returns the number of values actually parsed.
 static int parse_float_list(const char* str, float* out, int max_count) {
     int count = 0;
     if (str == NULL || *str == '\0') return 0;
@@ -172,6 +159,16 @@ static int parse_float_list(const char* str, float* out, int max_count) {
     return count;
 }
 
+// Task 7: validate a gain curve after loading. Returns true if the curve
+// is usable (non-zero count, ascending rates, no duplicates).
+static bool gain_curve_valid(const float* rates, const float* values, int count) {
+    if (count <= 0) return false;
+    for (int i = 1; i < count; i++) {
+        if (rates[i] <= rates[i - 1]) return false;  // not ascending (or duplicate)
+    }
+    return true;
+}
+
 static void load_gain_curve(ini_table_s* table, const char* section, const char* rates_key,
                              const char* values_key, float* rates, float* values, int* count) {
     const char* rates_str = ini_table_get_entry(table, section, rates_key);
@@ -179,14 +176,15 @@ static void load_gain_curve(ini_table_s* table, const char* section, const char*
     if (rates_str == NULL || values_str == NULL) {
         return;
     }
-    int rc = parse_float_list(rates_str, rates, MAX_GAIN_POINTS);
-    int vc = parse_float_list(values_str, values, MAX_GAIN_POINTS);
-    // Mismatched-length pairs are silently skipped (keeps whatever the
-    // profile already had -- either the hardcoded default or a prior
-    // section's value).
-    if (rc > 0 && rc == vc) {
-        *count = rc;
-    }
+    float tmp_rates[MAX_GAIN_POINTS];
+    float tmp_values[MAX_GAIN_POINTS];
+    int rc = parse_float_list(rates_str, tmp_rates, MAX_GAIN_POINTS);
+    int vc = parse_float_list(values_str, tmp_values, MAX_GAIN_POINTS);
+    if (rc <= 0 || rc != vc) return;  // mismatched or zero entries
+    if (!gain_curve_valid(tmp_rates, tmp_values, rc)) return;  // rejected
+    memcpy(rates, tmp_rates, rc * sizeof(float));
+    memcpy(values, tmp_values, rc * sizeof(float));
+    *count = rc;
 }
 
 static void load_section(ini_table_s* table, const char* section, GyroProfile* profile) {
@@ -248,6 +246,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_lightbar_state = LB_UNSET;
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
+    g_yaw_in_dz = false;
+    g_pitch_in_dz = false;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -267,6 +267,8 @@ static void start_recalibration(void) {
     g_stationary_count = 0;
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
+    g_yaw_in_dz = false;
+    g_pitch_in_dz = false;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -295,12 +297,55 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
-// Linear-interpolation gain lookup from a table of (rate_breakpoint,
-// gain_value) pairs. Below the first breakpoint the first gain is
-// returned; above the last, the last gain. Between breakpoints gain is
-// linearly interpolated (NOT a step function -- a hard jump right at a
-// breakpoint would itself feel like a glitch, which this response model
-// is trying to eliminate). Rates must be ascending.
+// Task 2: check whether the controller is genuinely stationary (both accel
+// and gyro) for calibration-sample admission.
+static bool calibration_sample_is_stationary(float gx, float gy, float gz,
+                                              float ax, float ay, float az) {
+    float accel_mag_sq = ax * ax + ay * ay + az * az;
+    if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
+        return false;
+    }
+    if (fabsf(gx) >= CALIB_GYRO_STILL_THRESHOLD ||
+        fabsf(gy) >= CALIB_GYRO_STILL_THRESHOLD ||
+        fabsf(gz) >= CALIB_GYRO_STILL_THRESHOLD) {
+        return false;
+    }
+    return true;
+}
+
+// Task 3: extended drift-correction stationary check — requires both accel
+// AND gyro to be still.
+static bool drift_sample_is_stationary(float gx, float gy, float gz,
+                                        float ax, float ay, float az) {
+    float accel_mag_sq = ax * ax + ay * ay + az * az;
+    if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
+        return false;
+    }
+    if (fabsf(gx) >= STATIONARY_GYRO_THRESHOLD ||
+        fabsf(gy) >= STATIONARY_GYRO_THRESHOLD ||
+        fabsf(gz) >= STATIONARY_GYRO_THRESHOLD) {
+        return false;
+    }
+    return true;
+}
+
+// Task 6: apply dead-zone with hysteresis. Returns true if the rate should
+// be treated as zero (inside the dead zone).
+static bool deadzone_with_hysteresis(float rate, float dead_zone, bool* in_dz) {
+    float av = fabsf(rate);
+    if (*in_dz) {
+        if (av < dead_zone * DEADZONE_EXIT_FRAC) return true;   // stay inside
+        *in_dz = false;
+        return false;
+    } else {
+        if (av < dead_zone * DEADZONE_ENTER_FRAC) {
+            *in_dz = true;
+            return true;  // just entered
+        }
+        return false;
+    }
+}
+
 static float gain_lookup(const float* rates, const float* values, int count, float abs_rate) {
     if (count <= 0) return 0.0f;
     if (abs_rate <= rates[0]) return values[0];
@@ -313,11 +358,10 @@ static float gain_lookup(const float* rates, const float* values, int count, flo
     return values[count - 1];
 }
 
-// Processes one axis: looks up gain for the current rate, then applies
-// EMA (while actively moving) or damping (while inside the dead zone) to
-// the persistent float_stick state. EMA and damping are mutually
-// exclusive per sample -- exactly one runs -- so their effects never
-// compound into a double-smoothed/double-lagged feel.
+// Task 1: damping is now interpolation-based (fraction toward zero per
+// sample) rather than a multiplier. With the new parameterization,
+// damping=0.12 means "move 12% toward zero each sample," equivalent to the
+// old damping=0.88 multiplier.
 static float process_axis(float rate, float* float_stick,
                            const float* gain_rates, const float* gain_values, int gain_count,
                            float alpha, float damping) {
@@ -329,32 +373,27 @@ static float process_axis(float rate, float* float_stick,
             *float_stick = raw;
         }
     } else {
-        *float_stick *= damping;
+        // Interpolation toward zero: fraction 'damping' of the distance
+        // to zero is covered each sample. More intuitive tuning and more
+        // consistent across polling rates than the old *= multiplier.
+        *float_stick += (0.0f - *float_stick) * damping;
     }
     return *float_stick;
 }
 
-// Converts the final float_stick value (signed stick-units, nominally
-// within about -128..128) to a uint8_t pad report value, applying soft
-// saturation and an optional dead-zone-bias floor, then SUMS it onto
-// whatever the physical stick's current position already is (read from
-// *axis, which holds the raw hardware reading at this point) rather than
-// overwriting it -- so gyro contributes ON TOP OF physical stick input
-// instead of replacing it while aiming. Soft saturation is applied to the
-// gyro component alone (the physical stick is already hardware-bounded to
-// -128..127, no need to saturate that separately); the final combined sum
-// is hard-clamped to the valid stick range.
+// Task 4: use lroundf() instead of (int) casts for float→int conversions
+// in the stick output path, for symmetry and precision around center.
 static void write_stick_uint8(uint8_t* axis, float stick, float knee, int dbias) {
     float sat = tanhf(stick / knee) * 128.0f;
     if (stick != 0.0f && dbias > 0) {
-        int si = (int)sat;
+        int si = lroundf(sat);
         int mag = si < 0 ? -si : si;
         if (mag < dbias) {
             sat = (sat < 0.0f) ? (float)(-dbias) : (float)dbias;
         }
     }
-    int phys = (int)(*axis) - STICK_CENTER;  // current physical stick position, signed
-    int combined = clamp_int(phys + (int)sat, -128, 127);
+    int phys = (int)(*axis) - STICK_CENTER;
+    int combined = clamp_int(phys + lroundf(sat), -128, 127);
     *axis = (uint8_t)clamp_int(combined + STICK_CENTER, STICK_MIN, STICK_MAX);
 }
 
@@ -384,9 +423,6 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
 
     if (!g_profile.enabled || !g_runtime_enabled) {
         set_lightbar(handle, LB_INACTIVE);
-        // Not aiming: keep the float stick pinned at 0 so the next aiming
-        // session starts fresh rather than partially blending in a stale
-        // value via the EMA once motion resumes.
         g_float_stick_x = 0.0f;
         g_float_stick_y = 0.0f;
         return;
@@ -399,31 +435,35 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (isnan(gy) || isinf(gy)) gy = 0.0f;
     if (isnan(gz) || isinf(gz)) gz = 0.0f;
 
-    // --- Calibration -----------------------------------------------------
+    // --- Calibration (task 2: only accept stationary samples) -------------
     if (!g_calibrated) {
         set_lightbar(handle, LB_CALIBRATING);
-        g_calib_sum[0] += gx;
-        g_calib_sum[1] += gy;
-        g_calib_sum[2] += gz;
-        g_calib_count++;
-        if (g_calib_count >= CALIB_SAMPLE_COUNT) {
-            g_bias[0] = g_calib_sum[0] / (float)g_calib_count;
-            g_bias[1] = g_calib_sum[1] / (float)g_calib_count;
-            g_bias[2] = g_calib_sum[2] / (float)g_calib_count;
-            g_calibrated = true;
-            log_info("gyro calibration complete: bias=[%f %f %f]\n", g_bias[0], g_bias[1], g_bias[2]);
+        float ax = pData->acceleration.x;
+        float ay = pData->acceleration.y;
+        float az = pData->acceleration.z;
+        if (calibration_sample_is_stationary(gx, gy, gz, ax, ay, az)) {
+            g_calib_sum[0] += gx;
+            g_calib_sum[1] += gy;
+            g_calib_sum[2] += gz;
+            g_calib_count++;
+            if (g_calib_count >= CALIB_SAMPLE_COUNT) {
+                g_bias[0] = g_calib_sum[0] / (float)g_calib_count;
+                g_bias[1] = g_calib_sum[1] / (float)g_calib_count;
+                g_bias[2] = g_calib_sum[2] / (float)g_calib_count;
+                g_calibrated = true;
+                log_info("gyro calibration complete: %d accepted samples, bias=[%f %f %f]\n",
+                         g_calib_count, g_bias[0], g_bias[1], g_bias[2]);
+            }
         }
         return;
     }
 
-    // --- Continuous drift tracking (only while not actively aiming) ------
+    // --- Continuous drift tracking (task 3: accel + gyro stillness) ------
     if (g_profile.drift_correction_enabled) {
         float ax = pData->acceleration.x;
         float ay = pData->acceleration.y;
         float az = pData->acceleration.z;
-        float accel_mag_sq = ax * ax + ay * ay + az * az;
-        bool now_stationary =
-            accel_mag_sq >= STATIONARY_ACCEL_LOW_SQ && accel_mag_sq <= STATIONARY_ACCEL_HIGH_SQ;
+        bool now_stationary = drift_sample_is_stationary(gx, gy, gz, ax, ay, az);
 
         if (now_stationary) {
             if (!g_is_stationary) {
@@ -446,31 +486,22 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     bool aiming = pData->analogButtons.l2 >= g_profile.trigger_threshold;
     set_lightbar(handle, aiming ? LB_ACTIVE : LB_INACTIVE);
     if (!aiming) {
-        // Same reasoning as the disabled-path reset above: L2 released
-        // means no aiming session is active, so the next press should
-        // start from a clean float_stick rather than a stale one.
         g_float_stick_x = 0.0f;
         g_float_stick_y = 0.0f;
         return;
     }
 
     // --- Response model: gain curve -> EMA/damping -> soft saturation ----
-    // yaw is primarily driven by whichever axis yaw_from_z selects, with
-    // an optional weighted blend of the OTHER axis -- for aiming motions
-    // that are naturally a combined rotation+tilt rather than a pure
-    // single-axis yaw (both axes' bias is already tracked above
-    // regardless of which is "primary", so this is just a sum of two
-    // already-bias-corrected rates).
     float yaw_primary = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
     float yaw_secondary = (g_profile.yaw_from_z ? gy : gz) - g_bias[g_profile.yaw_from_z ? 1 : 2];
     float yaw = yaw_primary + yaw_secondary * g_profile.yaw_tilt_weight;
     float pitch = gx - g_bias[0];
 
-    // Dead zone — zero out tiny residual motion. This gating also decides
-    // whether process_axis() below runs EMA (rate != 0) or damping
-    // (rate == 0) for each axis.
-    if (fabsf(yaw) < g_profile.dead_zone) yaw = 0.0f;
-    if (fabsf(pitch) < g_profile.dead_zone) pitch = 0.0f;
+    // Dead zone with hysteresis (task 6): different enter/exit thresholds
+    // prevent rapid oscillation between movement and damping near the
+    // boundary. Each axis has its own hysteresis state.
+    if (deadzone_with_hysteresis(yaw, g_profile.dead_zone, &g_yaw_in_dz)) yaw = 0.0f;
+    if (deadzone_with_hysteresis(pitch, g_profile.dead_zone, &g_pitch_in_dz)) pitch = 0.0f;
 
     if (g_profile.invert_x) yaw = -yaw;
     if (g_profile.invert_y) pitch = -pitch;

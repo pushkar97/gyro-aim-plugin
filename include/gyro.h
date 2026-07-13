@@ -52,12 +52,16 @@ typedef struct GyroProfile {
                              // (outside the dead zone); damping runs only
                              // when the rate is exactly zero (inside it).
                              // They never compound.
-    float damping_factor;   // Per-sample decay multiplier applied to
-                             // float_stick ONLY while the corrected rate is
-                             // exactly zero (inside the dead zone), so the
-                             // stick eases back to center over a few
-                             // samples instead of snapping instantly.
-                             // 1.0 = no damping (instant snap to 0).
+float damping_factor;   // Interpolation-based damping: the fraction of
+                             // the distance to zero covered each sample
+                             // while the corrected rate is exactly zero
+                             // (inside the dead zone):
+                             //   float_stick += (0 - float_stick) * damping.
+                             // 0.0 = no damping (sticks at current value);
+                             // higher values = faster decay. More
+                             // intuitive and less poll-rate-dependent than
+                             // the old multiplier-based approach
+                             // (task 1 of the refinement plan).
     float saturation_knee;  // Soft-saturation knee for
                              // tanhf(float_stick / knee) * 128 before the
                              // final integer conversion, replacing a hard
