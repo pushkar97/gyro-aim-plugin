@@ -16,10 +16,17 @@ typedef struct GyroProfile {
     int dead_zone_bias;     // stick units (0-127); minimum push applied when
                              // gyro contributes non-zero motion, so the game's
                              // own internal stick deadzone doesn't eat it.
-                             // Defaults to 0 -- the gain curve's boosted
-                             // low-end response should make this unnecessary
-                             // in most cases; it remains available as
-                             // optional fine-tuning only.
+                             // Defaults to 20 (empirically validated): the
+                             // gain curve's boosted low-end response alone
+                             // is NOT enough to clear most games' internal
+                             // stick deadzone at small movements (~2-10
+                             // stick units out of 128 near the DeadZone
+                             // threshold) -- confirmed by real-hardware
+                             // testing where small movements were silently
+                             // swallowed downstream, invisible to this
+                             // plugin and to the Mac tuner (which shows the
+                             // raw rightStick value with no game-side
+                             // deadzone in the way).
     int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
 
     // Gain curve: stick_raw = rate * gain(|rate|), where gain() linearly

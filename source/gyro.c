@@ -120,9 +120,25 @@ static void set_default_gain(float* rates, float* values, int* count) {
 void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->enabled = true;
     profile->dead_zone = 0.02f;
-    profile->dead_zone_bias = 0;  // gain curve's boosted low-end response
-                                   // should make this unnecessary by default
-                                   // (see task 5 of the response-model plan)
+    profile->dead_zone_bias = 20;  // The original response-model plan
+                                   // (task 5) assumed the gain curve's
+                                   // boosted low-end response would make
+                                   // this unnecessary at 0. Real-hardware
+                                   // testing showed otherwise: at the low
+                                   // end (rate just above DeadZone), the
+                                   // gain curve alone only produces ~2-10
+                                   // stick units out of 128 -- well below
+                                   // the ~10-20% internal deadzone most
+                                   // games apply to their OWN stick
+                                   // reading before it does anything. That
+                                   // deadzone is invisible to this plugin
+                                   // (and to the Mac tuner, which shows
+                                   // the raw rightStick value with no
+                                   // game-side deadzone in the way) --
+                                   // small gyro movements were being
+                                   // silently swallowed downstream. 20
+                                   // restores the previously-validated
+                                   // floor.
     profile->trigger_threshold = 250;
     set_default_gain(profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h);
     set_default_gain(profile->gain_rates_v, profile->gain_values_v, &profile->gain_count_v);
