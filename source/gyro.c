@@ -310,8 +310,16 @@ static int clamp_int(int v, int lo, int hi) {
 static bool calibration_sample_is_stationary(float gx, float gy, float gz,
                                               float ax, float ay, float az) {
     float accel_mag_sq = ax * ax + ay * ay + az * az;
-    if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
-        return false;
+    // If the accelerometer is returning near-zero (not providing data
+    // at all on this firmware / SDK version), skip the accel check and
+    // rely solely on gyro stillness below. A zero accel reading is NOT
+    // valid stationary data — it's just no data — and would otherwise
+    // fail < STATIONARY_ACCEL_LOW_SQ every time, blocking calibration
+    // indefinitely.
+    if (accel_mag_sq > 1.0f) {
+        if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
+            return false;
+        }
     }
     if (fabsf(gx) >= CALIB_GYRO_STILL_THRESHOLD ||
         fabsf(gy) >= CALIB_GYRO_STILL_THRESHOLD ||
@@ -326,8 +334,12 @@ static bool calibration_sample_is_stationary(float gx, float gy, float gz,
 static bool drift_sample_is_stationary(float gx, float gy, float gz,
                                         float ax, float ay, float az) {
     float accel_mag_sq = ax * ax + ay * ay + az * az;
-    if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
-        return false;
+    // Same zero-accel fallback as calibration: if the sensor isn't
+    // providing data, skip the accel check and rely on gyro stillness.
+    if (accel_mag_sq > 1.0f) {
+        if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
+            return false;
+        }
     }
     if (fabsf(gx) >= STATIONARY_GYRO_THRESHOLD ||
         fabsf(gy) >= STATIONARY_GYRO_THRESHOLD ||
