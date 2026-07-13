@@ -241,10 +241,10 @@ Enabled = true
 DeadZone = 0.02
 DeadZoneBias = 20
 TriggerThreshold = 250
-GainRates_H = 0.05 0.15 0.40 1.00 100.0
-GainValues_H = 90 70 50 35 25
-GainRates_V = 0.05 0.15 0.40 1.00 100.0
-GainValues_V = 90 70 50 35 25
+GainRates_H = 0.02 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 200 90 70 50 35 25
+GainRates_V = 0.02 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 200 90 70 50 35 25
 LowPassAlpha = 0.5
 DampingFactor = 0.88
 SaturationKnee = 100.0
@@ -258,9 +258,9 @@ DriftCorrectionEnabled = true
 ; Example: lower gain values for a title that needs less amplification,
 ; and gyro disabled while driving is handled manually via the L3+R3 toggle
 ; hotkey, not here.
-GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainRates_H = 0.02 0.05 0.15 0.40 1.00 100.0
 GainValues_H = 80 55 40 30 20
-GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainRates_V = 0.02 0.05 0.15 0.40 1.00 100.0
 GainValues_V = 80 55 40 30 20
 ```
 

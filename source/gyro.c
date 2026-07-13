@@ -107,9 +107,11 @@ static LightbarState g_lightbar_state = LB_UNSET;
 static float g_float_stick_x = 0.0f;
 static float g_float_stick_y = 0.0f;
 
-static const float kDefaultGainRates[] = { 0.05f, 0.15f, 0.40f, 1.00f, 100.0f };
-static const float kDefaultGainValues[] = { 90.0f, 70.0f, 50.0f, 35.0f, 25.0f };
-#define DEFAULT_GAIN_COUNT 5
+// Gain curves are shared between H and V by default but independently
+// configurable per axis (see gyroaim.ini / load_section).
+static const float kDefaultGainRates[] = { 0.02f, 0.05f, 0.15f, 0.40f, 1.00f, 100.0f };
+static const float kDefaultGainValues[] = { 200.0f, 90.0f, 70.0f, 50.0f, 35.0f, 25.0f };
+#define DEFAULT_GAIN_COUNT 6
 
 static void set_default_gain(float* rates, float* values, int* count) {
     memcpy(rates, kDefaultGainRates, sizeof(kDefaultGainRates));
