@@ -1,21 +1,25 @@
 [default]
 Enabled = true
-SensitivityH = 40.0
-SensitivityV = 40.0
 DeadZone = 0.02
-DeadZoneBias = 20
+DeadZoneBias = 0
 TriggerThreshold = 250
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 90 70 50 35 25
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 90 70 50 35 25
+LowPassAlpha = 1.0
+DampingFactor = 0.88
+SaturationKnee = 100.0
 InvertX = true
 InvertY = true
 YawFromZ = true
 YawTiltWeight = 0.3
-CurvePower = 2.0
-CurveMinRate = 0.15
 DriftCorrectionEnabled = true
-LowPassAlpha = 1.0
 
 ; Example per-title override. Replace CUSA00001 with a real title ID
 ; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).
 [CUSA00001]
-SensitivityH = 25.0
-SensitivityV = 25.0
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 80 55 40 30 20
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 80 55 40 30 20

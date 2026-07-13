@@ -19,6 +19,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gyro_common.h"
@@ -56,24 +57,60 @@ static bool g_recal_armed = true;  // prevents re-trigger until touchpad release
 
 static LightbarState g_lightbar_state = LB_UNSET;
 
-static float g_yaw_filtered = 0.0f;
-static float g_pitch_filtered = 0.0f;
+// Per-axis floating-point stick state. Persists across aim sessions (L2
+// feathering), decays via damping when gyro is deadzoning, and is
+// smoothed via EMA during active motion. Reset to 0.0 on
+// init/recalibration.
+static float g_float_stick_x = 0.0f;
+static float g_float_stick_y = 0.0f;
+
+static void set_default_gain(float* rates, float* values, int* count,
+                               float r1, float v1, float r2, float v2,
+                               float r3, float v3, float r4, float v4,
+                               float r5, float v5) {
+    rates[0] = r1; values[0] = v1;
+    rates[1] = r2; values[1] = v2;
+    rates[2] = r3; values[2] = v3;
+    rates[3] = r4; values[3] = v4;
+    rates[4] = r5; values[4] = v5;
+    *count = 5;
+}
 
 void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->enabled = true;
-    profile->sensitivity_h = 40.0f;
-    profile->sensitivity_v = 40.0f;
     profile->dead_zone = 0.02f;
-    profile->dead_zone_bias = 20;
+    profile->dead_zone_bias = 0;
     profile->trigger_threshold = 250;
+    set_default_gain(profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h,
+                     0.05f, 90.0f, 0.15f, 70.0f, 0.40f, 50.0f, 1.00f, 35.0f, 100.0f, 25.0f);
+    set_default_gain(profile->gain_rates_v, profile->gain_values_v, &profile->gain_count_v,
+                     0.05f, 90.0f, 0.15f, 70.0f, 0.40f, 50.0f, 1.00f, 35.0f, 100.0f, 25.0f);
+    profile->lowpass_alpha = 1.0f;
+    profile->damping_factor = 0.88f;
+    profile->saturation_knee = 100.0f;
     profile->invert_x = false;
     profile->invert_y = false;
     profile->yaw_from_z = false;
     profile->yaw_tilt_weight = 0.0f;
     profile->drift_correction_enabled = true;
-    profile->lowpass_alpha = 1.0f;
-    profile->curve_power = 2.0f;
-    profile->curve_min_rate = 0.15f;
+}
+
+// Parse a space-separated list of floats from `str` into `out` (max
+// `max_count` entries). Returns the number of values actually parsed.
+static int parse_float_list(const char* str, float* out, int max_count) {
+    int count = 0;
+    if (str == NULL || *str == '\0') return 0;
+    const char* p = str;
+    while (*p && count < max_count) {
+        while (*p == ' ') p++;
+        if (*p == '\0') break;
+        char* end;
+        out[count] = strtof(p, &end);
+        if (end == p) break;
+        count++;
+        p = end;
+    }
+    return count;
 }
 
 static void load_section(ini_table_s* table, const char* section, GyroProfile* profile) {
@@ -81,19 +118,36 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
         return;
     }
     ini_table_get_entry_as_bool(table, section, "Enabled", &profile->enabled);
-    ini_table_get_entry_as_float(table, section, "SensitivityH", &profile->sensitivity_h);
-    ini_table_get_entry_as_float(table, section, "SensitivityV", &profile->sensitivity_v);
     ini_table_get_entry_as_float(table, section, "DeadZone", &profile->dead_zone);
     ini_table_get_entry_as_int(table, section, "DeadZoneBias", &profile->dead_zone_bias);
     ini_table_get_entry_as_int(table, section, "TriggerThreshold", &profile->trigger_threshold);
+
+    // Gain curves: space-separated rate/value lists. If only one of the
+    // pair is present we ignore it (mismatched arity is silently skipped).
+    const char* rates_str = ini_table_get_entry(table, section, "GainRates_H");
+    const char* values_str = ini_table_get_entry(table, section, "GainValues_H");
+    if (rates_str != NULL && values_str != NULL) {
+        int rc = parse_float_list(rates_str, profile->gain_rates_h, MAX_GAIN_POINTS);
+        int vc = parse_float_list(values_str, profile->gain_values_h, MAX_GAIN_POINTS);
+        if (rc > 0 && rc == vc) profile->gain_count_h = rc;
+    }
+    rates_str = ini_table_get_entry(table, section, "GainRates_V");
+    values_str = ini_table_get_entry(table, section, "GainValues_V");
+    if (rates_str != NULL && values_str != NULL) {
+        int rc = parse_float_list(rates_str, profile->gain_rates_v, MAX_GAIN_POINTS);
+        int vc = parse_float_list(values_str, profile->gain_values_v, MAX_GAIN_POINTS);
+        if (rc > 0 && rc == vc) profile->gain_count_v = rc;
+    }
+
+    ini_table_get_entry_as_float(table, section, "LowPassAlpha", &profile->lowpass_alpha);
+    ini_table_get_entry_as_float(table, section, "DampingFactor", &profile->damping_factor);
+    ini_table_get_entry_as_float(table, section, "SaturationKnee", &profile->saturation_knee);
+
     ini_table_get_entry_as_bool(table, section, "InvertX", &profile->invert_x);
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
     ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
     ini_table_get_entry_as_float(table, section, "YawTiltWeight", &profile->yaw_tilt_weight);
     ini_table_get_entry_as_bool(table, section, "DriftCorrectionEnabled", &profile->drift_correction_enabled);
-    ini_table_get_entry_as_float(table, section, "LowPassAlpha", &profile->lowpass_alpha);
-    ini_table_get_entry_as_float(table, section, "CurvePower", &profile->curve_power);
-    ini_table_get_entry_as_float(table, section, "CurveMinRate", &profile->curve_min_rate);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -128,8 +182,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_touchpad_hold_count = 0;
     g_recal_armed = true;
     g_lightbar_state = LB_UNSET;
-    g_yaw_filtered = 0.0f;
-    g_pitch_filtered = 0.0f;
+    g_float_stick_x = 0.0f;
+    g_float_stick_y = 0.0f;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -147,8 +201,8 @@ static void start_recalibration(void) {
     memset(g_bias, 0, sizeof(g_bias));
     g_is_stationary = false;
     g_stationary_count = 0;
-    g_yaw_filtered = 0.0f;
-    g_pitch_filtered = 0.0f;
+    g_float_stick_x = 0.0f;
+    g_float_stick_y = 0.0f;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -177,64 +231,55 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
-// Applies signed exponential curve to the gyro rate so small movements
-// ramp up smoothly while big flicks still reach full speed.  power=1.0
-// is linear (no curve); 2.0 (default) gives a gentle s-curve feel.
-// Values below `min_rate` are passed through linearly (not curved) so
-// tiny residual bias doesn't get exponentially amplified into a
-// directional asymmetry — the curve only kicks in above the threshold.
-// Input is clamped before powf() so a sensor glitch/spike (the DS4 has
-// been observed emitting bad samples in this project before) can't
-// produce an enormous or infinite result that later causes undefined
-// behavior when cast to int.
-#define GYRO_RATE_CLAMP 30.0f  // rad/s; DS4 max spec is far below this
-static float signed_pow_curve(float v, float power, float min_rate) {
-    float av = fabsf(v);
-    if (v == 0.0f || power <= 0.001f || power == 1.0f) return v;
-    if (av < min_rate) return v;  // linear shoulder: no curve below threshold
-    if (av > GYRO_RATE_CLAMP) av = GYRO_RATE_CLAMP;
-    float sign = (v < 0.0f) ? -1.0f : 1.0f;
-    return sign * powf(av, power);
-}
-
-static void apply_stick_delta(uint8_t* axis, float delta_units, int dead_zone_bias) {
-    if (delta_units == 0.0f || isnan(delta_units)) {
-        return;
-    }
-
-    // The final result is clamped to the -128..127 stick range below
-    // regardless, but clamp the FLOAT here too, before the cast to int:
-    // casting a float that's outside int range (or +/-Inf) to int is
-    // undefined behavior in C, and on x86 can raise an FPU
-    // invalid-operation trap depending on exception-mask state -- a real
-    // crash risk if any upstream math (e.g. the exponential curve) ever
-    // produces an extreme value from a sensor glitch.
-    if (delta_units > 100000.0f) delta_units = 100000.0f;
-    if (delta_units < -100000.0f) delta_units = -100000.0f;
-
-    int delta = (int)delta_units;
-    if (delta == 0) {
-        // Rounds to zero in integer space but was non-zero in float space;
-        // still apply the minimum deadzone-bias push so tiny gyro motion
-        // isn't fully lost, matching the sign of the float delta.
-        delta = (delta_units > 0.0f) ? 1 : -1;
-    }
-
-    if (dead_zone_bias > 0) {
-        int mag = delta < 0 ? -delta : delta;
-        if (mag < dead_zone_bias) {
-            delta = (delta < 0) ? -dead_zone_bias : dead_zone_bias;
+// Linear-interpolation gain lookup from a table of (rate_breakpoint,
+// gain_value) pairs. Below the first breakpoint the first gain is
+// returned; above the last, the last gain. Between breakpoints gain is
+// linearly interpolated. Rates must be ascending.
+static float gain_lookup(const float* rates, const float* values, int count, float abs_rate) {
+    if (count <= 0) return 0.0f;
+    if (abs_rate <= rates[0]) return values[0];
+    for (int i = 1; i < count; i++) {
+        if (abs_rate <= rates[i]) {
+            float t = (abs_rate - rates[i - 1]) / (rates[i] - rates[i - 1]);
+            return values[i - 1] + t * (values[i] - values[i - 1]);
         }
     }
+    return values[count - 1];
+}
 
-    // Compute the stick position directly from center + delta this frame,
-    // rather than accumulating onto whatever the stick's previous/physical
-    // value was. Each sample's delta is a fresh instantaneous velocity-based
-    // value (no integration), so the output should be too -- reading back
-    // *axis as a base risked the gyro's contribution compounding across
-    // samples instead of representing "this frame's turn rate" cleanly.
-    int result = clamp_int(delta, -128, 127);
-    *axis = (uint8_t)clamp_int(result + STICK_CENTER, STICK_MIN, STICK_MAX);
+// Process one axis: apply gain curve, EMA, and damping to produce a new
+// float_stick value. Call with the bias-corrected / inverted / dead-zoned
+// rate and the persistent float_stick state.
+static float process_axis(float rate, float* float_stick,
+                           const float* gain_rates, const float* gain_values, int gain_count,
+                           float alpha, float damping) {
+    if (rate != 0.0f) {
+        float raw = rate * gain_lookup(gain_rates, gain_values, gain_count, fabsf(rate));
+        if (alpha < 1.0f) {
+            *float_stick += alpha * (raw - *float_stick);
+        } else {
+            *float_stick = raw;
+        }
+    } else {
+        *float_stick *= damping;
+    }
+    return *float_stick;
+}
+
+// Convert the final float_stick value (in signed stick-units, ~ -128..128
+// range) to a uint8_t, applying soft saturation and optional dead-zone
+// bias floor.
+static void write_stick_uint8(uint8_t* axis, float stick, float knee, int dbias) {
+    float sat = tanhf(stick / knee) * 128.0f;
+    if (stick != 0.0f && dbias > 0) {
+        int si = (int)sat;
+        int mag = si < 0 ? -si : si;
+        if (mag < dbias) {
+            sat = (sat < 0.0f) ? (float)(-dbias) : (float)dbias;
+        }
+    }
+    int val = clamp_int((int)sat, -128, 127) + STICK_CENTER;
+    *axis = (uint8_t)clamp_int(val, STICK_MIN, STICK_MAX);
 }
 
 void gyro_process_sample(int32_t handle, ScePadData* pData) {
@@ -322,43 +367,32 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         return;
     }
 
-    // --- Velocity-based mapping ---------------------------------------
+    // --- Velocity-based mapping (gain curve + EMA + damping) ----------
     // yaw is primarily driven by whichever axis yaw_from_z selects, with
-    // an optional weighted blend of the OTHER axis -- for aiming motions
-    // that are naturally a combined rotation+tilt rather than a pure
-    // single-axis yaw (both axes' bias is already tracked above
-    // regardless of which is "primary", so this is just a sum of two
-    // already-bias-corrected rates).
+    // an optional weighted blend of the OTHER axis.
     float yaw_primary = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
     float yaw_secondary = (g_profile.yaw_from_z ? gy : gz) - g_bias[g_profile.yaw_from_z ? 1 : 2];
     float yaw = yaw_primary + yaw_secondary * g_profile.yaw_tilt_weight;
     float pitch = gx - g_bias[0];
 
-    // Low-pass filter (EMA) on the bias-corrected rate, before dead
-    // zone/curve/sensitivity -- smooths sensor noise. alpha=1.0 (default)
-    // makes this a no-op (filtered value snaps to the raw value every
-    // sample).
-    if (g_profile.lowpass_alpha < 1.0f) {
-        float a = g_profile.lowpass_alpha;
-        if (a < 0.0f) a = 0.0f;
-        g_yaw_filtered += a * (yaw - g_yaw_filtered);
-        g_pitch_filtered += a * (pitch - g_pitch_filtered);
-        yaw = g_yaw_filtered;
-        pitch = g_pitch_filtered;
-    } else {
-        g_yaw_filtered = yaw;
-        g_pitch_filtered = pitch;
-    }
-
+    // Dead zone — zero out tiny residual motion.
     if (fabsf(yaw) < g_profile.dead_zone) yaw = 0.0f;
     if (fabsf(pitch) < g_profile.dead_zone) pitch = 0.0f;
 
     if (g_profile.invert_x) yaw = -yaw;
     if (g_profile.invert_y) pitch = -pitch;
 
-    float delta_x = signed_pow_curve(yaw, g_profile.curve_power, g_profile.curve_min_rate) * g_profile.sensitivity_h;
-    float delta_y = signed_pow_curve(pitch, g_profile.curve_power, g_profile.curve_min_rate) * g_profile.sensitivity_v;
+    float stick_x = process_axis(yaw, &g_float_stick_x,
+                                  g_profile.gain_rates_h, g_profile.gain_values_h,
+                                  g_profile.gain_count_h,
+                                  g_profile.lowpass_alpha, g_profile.damping_factor);
+    float stick_y = process_axis(pitch, &g_float_stick_y,
+                                  g_profile.gain_rates_v, g_profile.gain_values_v,
+                                  g_profile.gain_count_v,
+                                  g_profile.lowpass_alpha, g_profile.damping_factor);
 
-    apply_stick_delta(&pData->rightStick.x, delta_x, g_profile.dead_zone_bias);
-    apply_stick_delta(&pData->rightStick.y, delta_y, g_profile.dead_zone_bias);
+    write_stick_uint8(&pData->rightStick.x, stick_x, g_profile.saturation_knee,
+                      g_profile.dead_zone_bias);
+    write_stick_uint8(&pData->rightStick.y, stick_y, g_profile.saturation_knee,
+                      g_profile.dead_zone_bias);
 }

@@ -17,14 +17,13 @@ before relying on this.
 - Hooks both `scePadRead` (buffered) and `scePadReadState` (single latest),
   since it's not yet known which entry point any given target game uses.
 - Gyro rotation is mapped as a **velocity**, not integrated into an absolute
-  position: each sample, `(gyro_rate - bias) * sensitivity` is written
-  directly as the right stick's X/Y deflection (center + delta, not added
-  onto the previous stick value — see "Stick write is non-cumulative"
-  below), then clamped. This mirrors how native gyro-aim implementations
-  (e.g. Splatoon, JoyShockMapper) work, and avoids the drift-accumulation/
-  NaN-propagation issues integration-based approaches run into (see the
-  sibling `SDL/` gyro visualizer experiment for a worked example of exactly
-  those bugs).
+  position. Each sample goes through a configurable **gain curve** (rate
+  thresholds × gain values, linearly interpolated) that amplifies tiny
+  movements for precision while tapering large flicks so they don't
+  overshoot. The resulting stick output is EMA-smoothed (in floating-point,
+  `LowPassAlpha`), damped toward zero when the gyro is deadzoning
+  (`DampingFactor`), and soft-saturated via `tanhf` (`SaturationKnee`)
+  before the final integer conversion.
 - Gyro only contributes while L2 is fully pressed (`analogButtons.l2 >=
   TriggerThreshold`, default 250/255).
 - One-time startup calibration (first ~500 samples) plus continuous
@@ -32,8 +31,10 @@ before relying on this.
   toggle with `DriftCorrectionEnabled`) keep the camera from creeping
   during long aim holds.
 - Optional low-pass filter (`LowPassAlpha`, default `1.0`/off) smooths
-  sensor noise on the bias-corrected rate before dead zone/curve/
-  sensitivity are applied.
+  the stick output (not the gyro rate) via EMA.
+
+See the sibling `SDL/` gyro visualizer experiment for earlier approaches
+that were replaced by this design (exponential curve, gyro-rate EMA).
 - L3+R3 toggles gyro on/off at runtime (for vehicle sections, menus, etc. —
   see the config section below for per-title profiles as the primary
   mechanism, this hotkey is the manual escape hatch).
@@ -78,21 +79,6 @@ plugin) exist, and they disagree on some details:
   wall-clock duration (see comment at the top of `source/gyro.c`).
 
 ## Fixed: crash on game launch (HOOK_CONTINUE)
-
-## Stick write is non-cumulative
-
-`apply_stick_delta()` writes `center + delta` each sample, not
-`current_stick_value + delta`. Earlier this read back and added onto
-whatever the stick's previous/physical value was (matching the original
-"sum gyro with physical stick input, then clamp" design decision from
-initial planning). In practice this meant gyro's contribution to a given
-sample was based on whatever the stick already held, which isn't the same
-thing as "this frame's turn rate" — the non-cumulative version is more
-predictable and matches the velocity-based (no integration) model used
-everywhere else in this plugin. Net effect: while gyro is contributing
-(non-zero delta), it now fully determines that axis's stick value for that
-sample rather than adding to physical stick input; when gyro delta is
-exactly zero, physical stick input passes through untouched.
 
 First real-hardware test crashed every target game immediately on launch.
 Root cause: the initial implementation called through to the real
@@ -201,25 +187,28 @@ titles could flag it.
 ```ini
 [default]
 Enabled = true
-SensitivityH = 40.0
-SensitivityV = 40.0
 DeadZone = 0.02
-DeadZoneBias = 20
+DeadZoneBias = 0
 TriggerThreshold = 250
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 90 70 50 35 25
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 90 70 50 35 25
+LowPassAlpha = 1.0
+DampingFactor = 0.88
+SaturationKnee = 100.0
 InvertX = false
 InvertY = false
 YawFromZ = true
 YawTiltWeight = 0.3
-CurvePower = 2.0
-CurveMinRate = 0.15
 DriftCorrectionEnabled = true
-LowPassAlpha = 1.0
 
 [CUSA00001]
-; Example: this specific title needs lower sensitivity and gyro disabled
-; while driving is handled manually via the L3+R3 toggle hotkey, not here.
-SensitivityH = 25.0
-SensitivityV = 25.0
+; Example: lower gain values for a title that needs less amplification.
+GainRates_H = 0.05 0.15 0.40 1.00 100.0
+GainValues_H = 80 55 40 30 20
+GainRates_V = 0.05 0.15 0.40 1.00 100.0
+GainValues_V = 80 55 40 30 20
 ```
 
 See `gyroaim.ini.example` for a ready-to-copy version of the above.
