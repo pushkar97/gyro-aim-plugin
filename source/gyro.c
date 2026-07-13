@@ -59,6 +59,19 @@
 #define STATIONARY_SAMPLE_COUNT 250   // consecutive still samples before drift EMA kicks in
 #define DRIFT_ALPHA 0.01f
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
+// Squared bounds for the stationary check below, avoiding a sqrtf() call
+// on every sample (this block runs unconditionally once calibrated,
+// regardless of whether the player is aiming, making it the single most
+// frequently-executed transcendental-function call site in this file
+// before this change). sqrt is monotonic for non-negative inputs, so
+// "sqrt(x) in [lo, hi]" <=> "x in [lo^2, hi^2]" for lo, hi >= 0 -- these
+// are compile-time constants (simple literal arithmetic, folded
+// regardless of optimization level), so this is a pure win with no
+// change in behavior.
+#define STATIONARY_ACCEL_LOW_SQ \
+    ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
+#define STATIONARY_ACCEL_HIGH_SQ \
+    ((9.80665f + STATIONARY_ACCEL_TOLERANCE) * (9.80665f + STATIONARY_ACCEL_TOLERANCE))
 #define STICK_CENTER 128
 #define STICK_MIN 0
 #define STICK_MAX 255
@@ -380,8 +393,9 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         float ax = pData->acceleration.x;
         float ay = pData->acceleration.y;
         float az = pData->acceleration.z;
-        float accel_mag = sqrtf(ax * ax + ay * ay + az * az);
-        bool now_stationary = fabsf(accel_mag - 9.80665f) < STATIONARY_ACCEL_TOLERANCE;
+        float accel_mag_sq = ax * ax + ay * ay + az * az;
+        bool now_stationary =
+            accel_mag_sq >= STATIONARY_ACCEL_LOW_SQ && accel_mag_sq <= STATIONARY_ACCEL_HIGH_SQ;
 
         if (now_stationary) {
             if (!g_is_stationary) {
