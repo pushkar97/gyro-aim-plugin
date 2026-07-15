@@ -247,12 +247,15 @@ GainRates_V = 0.02 0.05 0.15 0.40 1.00 100.0
 GainValues_V = 140 100 70 50 35 25
 LowPassAlpha = 0.5
 DampingFactor = 0.12
-SaturationKnee = 100.0
+SaturationStrength = 2.0
 InvertX = false
 InvertY = false
 YawFromZ = true
 YawTiltWeight = 0.3
 DriftCorrectionEnabled = true
+BiasAlpha = 0.01
+BiasErrorThreshold = 0.08
+BiasStationarySamples = 60
 
 [CUSA00001]
 ; Example: lower gain values for a title that needs less amplification,

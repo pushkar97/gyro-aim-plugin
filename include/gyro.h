@@ -62,12 +62,15 @@ float damping_factor;   // Interpolation-based damping: the fraction of
                              // intuitive and less poll-rate-dependent than
                              // the old multiplier-based approach
                              // (task 1 of the refinement plan).
-    float saturation_knee;  // Soft-saturation knee for
-                             // tanhf(float_stick / knee) * 128 before the
-                             // final integer conversion, replacing a hard
-                             // clamp with a smooth asymptote. Smaller knee
-                             // = earlier/softer rolloff before hitting the
-                             // physical stick's max deflection.
+float saturation_strength;  // Soft-saturation strength for
+                              // tanhf(normalized * strength) * 128, where
+                              // normalized = float_stick / 128.0. Decoupled
+                              // from the gain curve (unlike the old
+                              // "knee" parameter, which was in the same
+                              // units as the stick value and changed
+                              // behaviour whenever the gain curve was
+                              // retuned). 1.0 = gentle, 2.0 = moderate
+                              // (default), 3.0 = barely saturates.
 
     bool invert_x;
     bool invert_y;
@@ -86,14 +89,29 @@ float damping_factor;   // Interpolation-based damping: the fraction of
                              // motion is a combined rotation+tilt rather
                              // than a pure single-axis yaw -- e.g. 0.3-0.5
                              // adds a noticeable but secondary contribution.
-    bool drift_correction_enabled;  // true (default): continuously re-average
-                             // gyro bias while the controller is detected as
-                             // stationary (via accelerometer magnitude), to
-                             // counter slow real-world drift during long aim
-                             // holds. Set false to rely solely on the
-                             // one-time startup/recalibration-hotkey bias
-                             // instead, if continuous correction is ever
-                             // fighting a deliberately-held tilt.
+    bool drift_correction_enabled;  // true (default): continuously refine
+                             // gyro bias via background EMA while the
+                             // player is NOT aiming (L2 released) and the
+                             // controller is stationary. Uses idle
+                             // gameplay time (cutscenes, menus, running
+                             // without aiming) and NEVER runs while
+                             // aiming — deliberate motion cannot corrupt
+                             // the estimate. Set false to rely solely on
+                             // the one-time startup/recalibration bias.
+    float bias_alpha;            // EMA blend per accepted sample (0.01
+                             // default). Very slow — the bias estimator
+                             // requires several seconds of stationary
+                             // controller time to produce a noticeable
+                             // change. Lower = more conservative.
+    float bias_error_threshold;  // rad/s (0.05 default). |raw - bias|
+                             // must be below this before bias is updated.
+                             // Only nudges the bias when it's already
+                             // close — deliberate motion is never
+                             // accidentally learned as bias.
+    int bias_stationary_samples; // consecutive still samples required
+                             // before bias estimation begins (60
+                             // default, ~250ms at 250Hz / ~1s at 60Hz).
+                             // Prevents transient-motion corruption.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

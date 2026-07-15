@@ -54,20 +54,37 @@
 #include "platform.h"
 
 #define CALIB_SAMPLE_COUNT 500        // accepted stationary samples needed
-#define STATIONARY_SAMPLE_COUNT 100   // consecutive still samples before drift EMA kicks in
-#define DRIFT_ALPHA 0.03f              // fraction blended toward observed bias each sample
-                                        // (raised from 0.01 for faster self-correction)
-#define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665 counted as "still"
-#define STATIONARY_GYRO_THRESHOLD 0.10f  // rad/s; all gyro axes must be below
-                                           // this for drift-correction to
-                                           // consider the controller
-                                           // stationary. Raised from 0.05
-                                           // because the DS4's Z-axis has a
-                                           // confirmed ~0.05 rad/s resting
-                                           // bias, which would always fail
-                                           // the check and prevent drift
-                                           // correction from ever running.
-// Squared accel bounds — avoids a sqrtf() call on every sample (see below).
+// --- Bias estimation (replaces the old drift-correction system) ----------
+// Bias estimation only runs when the player is NOT aiming (L2 released),
+// making use of the large amount of idle time that naturally occurs during
+// gameplay (cutscenes, menus, running without aiming, etc.). Each axis
+// converges independently so a noisy gyro channel never blocks the others.
+//
+// Pipeline:
+//   1. Startup calibration gives a rough initial bias estimate.
+//   2. At runtime, whenever NOT aiming AND the controller is stationary
+//      (accel near gravity + raw gyro below threshold) for a minimum
+//      number of consecutive samples, the bias is slowly nudged via EMA
+//      toward the observed reading.
+//   3. An additional error check (|raw - bias| < threshold) ensures the
+//      bias is only updated when it's already close — deliberate motion
+//      is never accidentally learned as bias.
+//
+// The tunable bias parameters (alpha, error threshold, stationary sample
+// count) are now in GyroProfile (see gyro.h) and configurable via
+// gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples).
+// These remaining defines are non-user-facing infrastructure.
+#define BIAS_STATIONARY_GYRO_THRESHOLD 0.15f  // rad/s; raw gyro must be below
+                                               // this for the controller to be
+                                               // considered stationary. Must be
+                                               // generous enough to pass with
+                                               // natural hand tremor when
+                                               // holding the controller in a
+                                               // resting position (not just
+                                               // flat on a table).
+#define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
+
+#define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
 #define STATIONARY_ACCEL_LOW_SQ \
     ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
 #define STATIONARY_ACCEL_HIGH_SQ \
@@ -96,8 +113,8 @@ static int g_calib_count = 0;          // accepted (stationary) samples
 static float g_calib_sum[3] = { 0, 0, 0 };
 static float g_bias[3] = { 0, 0, 0 };
 
-static bool g_is_stationary = false;
-static int g_stationary_count = 0;
+static bool g_is_stationary[3] = { false, false, false };
+static int g_stationary_count[3] = { 0, 0, 0 };
 
 static bool g_runtime_enabled = true;
 static bool g_prev_l3r3_held = false;
@@ -106,6 +123,8 @@ static int g_touchpad_hold_count = 0;
 static bool g_recal_armed = true;
 
 static LightbarState g_lightbar_state = LB_UNSET;
+
+static int g_bias_log_counter = 0;  // rate-limit bias estimation logs
 
 static GyroDebug g_debug;
 
@@ -141,12 +160,15 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     // Task 1: damping is now interpolation-based (fraction moved toward
     // zero per sample, not a multiplier). 0.12 ≈ the old *= 0.88 feel.
     profile->damping_factor = 0.12f;
-    profile->saturation_knee = 100.0f;
+    profile->saturation_strength = 2.0f;
     profile->invert_x = false;
     profile->invert_y = false;
     profile->yaw_from_z = false;
     profile->yaw_tilt_weight = 0.0f;
     profile->drift_correction_enabled = true;
+    profile->bias_alpha = 0.01f;
+    profile->bias_error_threshold = 0.08f;
+    profile->bias_stationary_samples = 60;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -209,13 +231,16 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
 
     ini_table_get_entry_as_float(table, section, "LowPassAlpha", &profile->lowpass_alpha);
     ini_table_get_entry_as_float(table, section, "DampingFactor", &profile->damping_factor);
-    ini_table_get_entry_as_float(table, section, "SaturationKnee", &profile->saturation_knee);
+    ini_table_get_entry_as_float(table, section, "SaturationStrength", &profile->saturation_strength);
 
     ini_table_get_entry_as_bool(table, section, "InvertX", &profile->invert_x);
     ini_table_get_entry_as_bool(table, section, "InvertY", &profile->invert_y);
     ini_table_get_entry_as_bool(table, section, "YawFromZ", &profile->yaw_from_z);
     ini_table_get_entry_as_float(table, section, "YawTiltWeight", &profile->yaw_tilt_weight);
     ini_table_get_entry_as_bool(table, section, "DriftCorrectionEnabled", &profile->drift_correction_enabled);
+    ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
+    ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
+    ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -243,8 +268,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
-    g_is_stationary = false;
-    g_stationary_count = 0;
+    memset(g_is_stationary, 0, sizeof(g_is_stationary));
+    memset(g_stationary_count, 0, sizeof(g_stationary_count));
     g_runtime_enabled = true;
     g_prev_l3r3_held = false;
     g_touchpad_hold_count = 0;
@@ -273,8 +298,8 @@ static void start_recalibration(void) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
-    g_is_stationary = false;
-    g_stationary_count = 0;
+    memset(g_is_stationary, 0, sizeof(g_is_stationary));
+    memset(g_stationary_count, 0, sizeof(g_stationary_count));
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
     g_yaw_in_dz = false;
@@ -307,21 +332,17 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
-// Task 2: check whether the controller is genuinely stationary (both accel
-// and gyro) for calibration-sample admission.
-static bool drift_sample_is_stationary(float gx, float gy, float gz,
-                                        float ax, float ay, float az) {
+// Per-axis stationary check for bias estimation: accel near gravity AND
+// a single gyro axis below the stationary threshold. Called independently
+// per axis so one noisy channel never blocks the others from converging.
+static bool bias_axis_is_stationary(float gval, float ax, float ay, float az) {
     float accel_mag_sq = ax * ax + ay * ay + az * az;
-    // Same zero-accel fallback as calibration: if the sensor isn't
-    // providing data, skip the accel check and rely on gyro stillness.
     if (accel_mag_sq > 1.0f) {
         if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
             return false;
         }
     }
-    if (fabsf(gx) >= STATIONARY_GYRO_THRESHOLD ||
-        fabsf(gy) >= STATIONARY_GYRO_THRESHOLD ||
-        fabsf(gz) >= STATIONARY_GYRO_THRESHOLD) {
+    if (fabsf(gval) >= BIAS_STATIONARY_GYRO_THRESHOLD) {
         return false;
     }
     return true;
@@ -381,8 +402,8 @@ static float process_axis(float rate, float* float_stick,
 
 // Task 4: use lroundf() instead of (int) casts for float→int conversions
 // in the stick output path, for symmetry and precision around center.
-static void write_stick_uint8(uint8_t* axis, float stick, float knee, int dbias) {
-    float sat = tanhf(stick / knee) * 128.0f;
+static void write_stick_uint8(uint8_t* axis, float stick, float strength, int dbias) {
+    float sat = tanhf((stick / 128.0f) * strength) * 128.0f;
     if (stick != 0.0f && dbias > 0) {
         int si = lroundf(sat);
         int mag = si < 0 ? -si : si;
@@ -467,34 +488,47 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         return;
     }
 
-    // --- Continuous drift tracking (task 3: accel + gyro stillness) ------
-    if (g_profile.drift_correction_enabled) {
-        float ax = pData->acceleration.x;
-        float ay = pData->acceleration.y;
-        float az = pData->acceleration.z;
-        bool now_stationary = drift_sample_is_stationary(gx, gy, gz, ax, ay, az);
-
-        if (now_stationary) {
-            if (!g_is_stationary) {
-                g_is_stationary = true;
-                g_stationary_count = 0;
-            }
-            g_stationary_count++;
-            if (g_stationary_count >= STATIONARY_SAMPLE_COUNT) {
-                g_bias[0] += DRIFT_ALPHA * (gx - g_bias[0]);
-                g_bias[1] += DRIFT_ALPHA * (gy - g_bias[1]);
-                g_bias[2] += DRIFT_ALPHA * (gz - g_bias[2]);
-            }
-        } else {
-            g_is_stationary = false;
-            g_stationary_count = 0;
-        }
-    }
-
     // --- Trigger gate ------------------------------------------------------
     bool aiming = pData->analogButtons.l2 >= g_profile.trigger_threshold;
     set_lightbar(handle, aiming ? LB_ACTIVE : LB_INACTIVE);
     if (!aiming) {
+        // Bias estimation: only runs when the player is NOT aiming,
+        // making use of idle time (cutscenes, menus, running without
+        // aiming, etc.) to slowly refine the gyro bias. Each axis
+        // converges independently — a noisy gyro channel never blocks
+        // the others. Bias is NEVER updated while aiming (L2 held), so
+        // deliberate controller motion cannot corrupt the estimate.
+        if (g_profile.drift_correction_enabled) {
+            float ax = pData->acceleration.x;
+            float ay = pData->acceleration.y;
+            float az = pData->acceleration.z;
+            float gyro_vals[3] = { gx, gy, gz };
+
+            for (int i = 0; i < 3; i++) {
+                float error = gyro_vals[i] - g_bias[i];
+                if (bias_axis_is_stationary(gyro_vals[i], ax, ay, az) &&
+                    fabsf(error) < g_profile.bias_error_threshold) {
+                    if (!g_is_stationary[i]) {
+                        g_is_stationary[i] = true;
+                        g_stationary_count[i] = 0;
+                    }
+                    g_stationary_count[i]++;
+                    if (g_stationary_count[i] >= g_profile.bias_stationary_samples) {
+                        g_bias[i] += g_profile.bias_alpha * error;
+                        g_bias_log_counter++;
+                        if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
+                            g_bias_log_counter = 0;
+                            log_info("bias: g=[%+.4f %+.4f %+.4f] bias=[%+.4f %+.4f %+.4f] err=[%+.4f %+.4f %+.4f]\n",
+                                     gx, gy, gz, g_bias[0], g_bias[1], g_bias[2],
+                                     gx - g_bias[0], gy - g_bias[1], gz - g_bias[2]);
+                        }
+                    }
+                } else {
+                    g_is_stationary[i] = false;
+                    g_stationary_count[i] = 0;
+                }
+            }
+        }
         g_float_stick_x = 0.0f;
         g_float_stick_y = 0.0f;
         return;
@@ -527,8 +561,8 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                                   g_profile.gain_count_v,
                                   g_profile.lowpass_alpha, g_profile.damping_factor);
 
-    write_stick_uint8(&pData->rightStick.x, stick_x, g_profile.saturation_knee,
+    write_stick_uint8(&pData->rightStick.x, stick_x, g_profile.saturation_strength,
                        g_profile.dead_zone_bias);
-    write_stick_uint8(&pData->rightStick.y, stick_y, g_profile.saturation_knee,
+    write_stick_uint8(&pData->rightStick.y, stick_y, g_profile.saturation_strength,
                        g_profile.dead_zone_bias);
 }
