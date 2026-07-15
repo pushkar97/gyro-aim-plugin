@@ -126,8 +126,7 @@ static float g_float_stick_y = 0.0f;
 // Dead-zone hysteresis state (task 6): track whether each axis is
 // currently inside the dead zone so we can apply different enter/exit
 // thresholds. Reset on calibration.
-static bool g_yaw_in_dz = false;
-static bool g_pitch_in_dz = false;
+static bool g_vec_deadzone = false;  // hysteresis state for vector magnitude
 
 // Default gain curve. Tuned down from the previous extremely aggressive
 // first breakpoint (200→140) per task 5.
@@ -269,8 +268,7 @@ void gyro_state_init(const GyroProfile* profile) {
     g_lightbar_state = LB_UNSET;
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
-    g_yaw_in_dz = false;
-    g_pitch_in_dz = false;
+    g_vec_deadzone = false;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -294,8 +292,7 @@ static void start_recalibration(void) {
     g_stationary_timer = 0;
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
-    g_yaw_in_dz = false;
-    g_pitch_in_dz = false;
+    g_vec_deadzone = false;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -325,19 +322,20 @@ static int clamp_int(int v, int lo, int hi) {
 }
 
 
-// Task 6: apply dead-zone with hysteresis. Returns true if the rate should
-// be treated as zero (inside the dead zone).
-static bool deadzone_with_hysteresis(float rate, float dead_zone, bool* in_dz) {
-    float av = fabsf(rate);
-    if (*in_dz) {
-        if (av < dead_zone * DEADZONE_EXIT_FRAC) return true;   // stay inside
-        *in_dz = false;
+
+// Vector deadzone with hysteresis (magnitude-based, not per-axis).
+// All directions deadzone consistently at the same rotational speed.
+// Returns true if the vector should be treated as zero.
+static bool vec_deadzone_with_hysteresis(float mag, float dead_zone, bool* alive) {
+    if (*alive) {
+        if (mag < dead_zone * DEADZONE_ENTER_FRAC) {
+            *alive = false;
+            return true;
+        }
         return false;
     } else {
-        if (av < dead_zone * DEADZONE_ENTER_FRAC) {
-            *in_dz = true;
-            return true;  // just entered
-        }
+        if (mag < dead_zone * DEADZONE_EXIT_FRAC) return true;
+        *alive = true;
         return false;
     }
 }
@@ -354,45 +352,69 @@ static float gain_lookup(const float* rates, const float* values, int count, flo
     return values[count - 1];
 }
 
-// Task 1: damping is now interpolation-based (fraction toward zero per
-// sample) rather than a multiplier. With the new parameterization,
-// damping=0.12 means "move 12% toward zero each sample," equivalent to the
-// old damping=0.88 multiplier.
-static float process_axis(float rate, float* float_stick,
-                           const float* gain_rates, const float* gain_values, int gain_count,
-                           float alpha, float damping) {
-    if (rate != 0.0f) {
-        float raw = rate * gain_lookup(gain_rates, gain_values, gain_count, fabsf(rate));
+// Vector-based response pipeline. Computes stick_x/stick_y from yaw/pitch
+// treating them as a 2D rotation vector. Preserves movement direction
+// through the entire pipeline: the normalized vector (norm_x, norm_y)
+// captures the user's intended aim direction, and only the MAGNITUDE is
+// scaled/clamped/saturated.
+static void process_vector(float yaw, float pitch,
+                            float* float_stick_x, float* float_stick_y,
+                            const float* gain_rates, const float* gain_values, int gain_count,
+                            float alpha, float damping,
+                            float dead_zone, float saturation_strength, int dead_zone_bias) {
+    float mag = sqrtf(yaw * yaw + pitch * pitch);
+
+    // Vector deadzone with hysteresis on magnitude
+    if (vec_deadzone_with_hysteresis(mag, dead_zone, &g_vec_deadzone)) {
+        mag = 0.0f;
+    }
+
+    if (mag > 0.0f) {
+        // Normalize the direction vector
+        float norm_x = yaw / mag;
+        float norm_y = pitch / mag;
+
+        // Gain lookup on vector magnitude
+        float gain = gain_lookup(gain_rates, gain_values, gain_count, mag);
+        float output_mag = gain * mag;
+
+        // DeadZoneBias: minimum output magnitude (direction preserved)
+        if (dead_zone_bias > 0 && output_mag > 0.0f && output_mag < (float)dead_zone_bias) {
+            output_mag = (float)dead_zone_bias;
+        }
+
+        // Saturation on the output magnitude (direction preserved)
+        float sat_mag = tanhf((output_mag / 128.0f) * saturation_strength) * 128.0f;
+
+        float raw_x = norm_x * sat_mag;
+        float raw_y = norm_y * sat_mag;
+
+        // Per-axis output smoothing (EMA)
         if (alpha < 1.0f) {
-            *float_stick += alpha * (raw - *float_stick);
+            *float_stick_x += alpha * (raw_x - *float_stick_x);
+            *float_stick_y += alpha * (raw_y - *float_stick_y);
         } else {
-            *float_stick = raw;
+            *float_stick_x = raw_x;
+            *float_stick_y = raw_y;
         }
     } else {
-        // Interpolation toward zero: fraction 'damping' of the distance
-        // to zero is covered each sample. More intuitive tuning and more
-        // consistent across polling rates than the old *= multiplier.
-        *float_stick += (0.0f - *float_stick) * damping;
+        // Damping: interpolation toward zero (per-axis, as before)
+        *float_stick_x += (0.0f - *float_stick_x) * damping;
+        *float_stick_y += (0.0f - *float_stick_y) * damping;
+        // Snap to zero once decay is negligible
+        if (fabsf(*float_stick_x) < 0.01f) *float_stick_x = 0.0f;
+        if (fabsf(*float_stick_y) < 0.01f) *float_stick_y = 0.0f;
     }
-    return *float_stick;
 }
 
-// Task 4: use lroundf() instead of (int) casts for float→int conversions
-// in the stick output path, for symmetry and precision around center.
-static void write_stick_uint8(uint8_t* axis, float stick, float strength, int dbias) {
-    float sat = tanhf((stick / 128.0f) * strength) * 128.0f;
-    if (stick != 0.0f && dbias > 0) {
-        int si = lroundf(sat);
-        int mag = si < 0 ? -si : si;
-        if (mag < dbias) {
-            sat = (sat < 0.0f) ? (float)(-dbias) : (float)dbias;
-        }
-    }
+// Write a float stick value to uint8, summing with the physical stick
+// position. DeadZoneBias is already handled upstream in process_vector()
+// — this is just the final conversion + clamp.
+static void write_stick_uint8(uint8_t* axis, float stick) {
     int phys = (int)(*axis) - STICK_CENTER;
-    int combined = clamp_int(phys + lroundf(sat), -128, 127);
+    int combined = clamp_int(phys + lroundf(stick), -128, 127);
     *axis = (uint8_t)clamp_int(combined + STICK_CENTER, STICK_MIN, STICK_MAX);
 }
-
 void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (!pData->connected) {
         return;
@@ -518,17 +540,15 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         return;
     }
 
-    // --- Response model: gain curve -> EMA/damping -> soft saturation ----
+    // --- Response model: vector-based (gain curve -> DeadZoneBias -> saturation -> EMA) -
+    // The yaw/pitch pair is treated as a 2D rotation vector: the magnitude
+    // determines speed, the normalized vector preserves the user's intended
+    // direction. Diagonal movement now feels identical to pure
+    // horizontal/vertical at the same rotational speed.
     float yaw_primary = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
     float yaw_secondary = (g_profile.yaw_from_z ? gy : gz) - g_bias[g_profile.yaw_from_z ? 1 : 2];
     float yaw = yaw_primary + yaw_secondary * g_profile.yaw_tilt_weight;
     float pitch = gx - g_bias[0];
-
-    // Dead zone with hysteresis (task 6): different enter/exit thresholds
-    // prevent rapid oscillation between movement and damping near the
-    // boundary. Each axis has its own hysteresis state.
-    if (deadzone_with_hysteresis(yaw, g_profile.dead_zone, &g_yaw_in_dz)) yaw = 0.0f;
-    if (deadzone_with_hysteresis(pitch, g_profile.dead_zone, &g_pitch_in_dz)) pitch = 0.0f;
 
     if (g_profile.invert_x) yaw = -yaw;
     if (g_profile.invert_y) pitch = -pitch;
@@ -536,17 +556,13 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     g_debug.yaw = yaw;
     g_debug.pitch = pitch;
 
-    float stick_x = process_axis(yaw, &g_float_stick_x,
-                                  g_profile.gain_rates_h, g_profile.gain_values_h,
-                                  g_profile.gain_count_h,
-                                  g_profile.lowpass_alpha, g_profile.damping_factor);
-    float stick_y = process_axis(pitch, &g_float_stick_y,
-                                  g_profile.gain_rates_v, g_profile.gain_values_v,
-                                  g_profile.gain_count_v,
-                                  g_profile.lowpass_alpha, g_profile.damping_factor);
+    process_vector(yaw, pitch,
+                   &g_float_stick_x, &g_float_stick_y,
+                   g_profile.gain_rates_h, g_profile.gain_values_h,
+                   g_profile.gain_count_h,
+                   g_profile.lowpass_alpha, g_profile.damping_factor,
+                   g_profile.dead_zone, g_profile.saturation_strength, g_profile.dead_zone_bias);
 
-    write_stick_uint8(&pData->rightStick.x, stick_x, g_profile.saturation_strength,
-                       g_profile.dead_zone_bias);
-    write_stick_uint8(&pData->rightStick.y, stick_y, g_profile.saturation_strength,
-                       g_profile.dead_zone_bias);
+    write_stick_uint8(&pData->rightStick.x, g_float_stick_x);
+    write_stick_uint8(&pData->rightStick.y, g_float_stick_y);
 }

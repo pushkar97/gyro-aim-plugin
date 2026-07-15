@@ -12,29 +12,27 @@
 // Per-title (or [default]) config, loaded once at plugin_load.
 typedef struct GyroProfile {
     bool enabled;
-    float dead_zone;        // rad/s; |corrected gyro| below this is treated as 0
-    int dead_zone_bias;     // stick units (0-127); minimum push applied when
-                             // gyro contributes non-zero motion, so the game's
-                             // own internal stick deadzone doesn't eat it.
-                             // Defaults to 20 (empirically validated): the
-                             // gain curve's boosted low-end response alone
-                             // is NOT enough to clear most games' internal
-                             // stick deadzone at small movements (~2-10
-                             // stick units out of 128 near the DeadZone
-                             // threshold) -- confirmed by real-hardware
-                             // testing where small movements were silently
-                             // swallowed downstream, invisible to this
-                             // plugin and to the Mac tuner (which shows the
-                             // raw rightStick value with no game-side
-                             // deadzone in the way).
-    int trigger_threshold;  // L2 analogButtons.l2 value (0-255) counted as "held"
+    float dead_zone;        // rad/s; vector magnitude below this is treated
+                             // as zero (deadzone applied to |(yaw,pitch)|,
+                             // not per-axis — diagonal movement
+                             // consistently deadzones at the same
+                             // rotational speed as cardinal).
+    int dead_zone_bias;     // stick units (0-127); minimum output vector
+                             // MAGNITUDE applied when gyro contributes
+                             // non-zero motion, so the game's own internal
+                             // stick deadzone doesn't eat it. Direction is
+                             // preserved (not a per-axis floor — the
+                             // vector preserves the intended angle).
+                             // Defaults to 20.
+    int trigger_threshold;
 
-    // Gain curve: stick_raw = rate * gain(|rate|), where gain() linearly
-    // interpolates between (rate, gain) breakpoints. Below the first
-    // breakpoint the first gain applies; above the last, the last gain.
-    // Rates must be ascending. Independently configurable per axis (H =
-    // yaw/horizontal, V = pitch/vertical) so their response curves can
-    // evolve separately.
+    // Gain curve (direction-independent): stick_magnitude = gain(rate_magnitude)
+    // * rate_magnitude. Linearly interpolated between (rate, gain) breakpoints.
+    // A single curve applies regardless of movement direction — diagonal
+    // movements use the same gain as pure horizontal/vertical at the same
+    // rotational speed. gain_rates_h/values_h serve as the active curve;
+    // gain_rates_v/values_v are stored for backwards compat with existing
+    // configs but are DEPRECATED in the response model (only H is used).
     float gain_rates_h[MAX_GAIN_POINTS];
     float gain_values_h[MAX_GAIN_POINTS];
     int gain_count_h;
@@ -62,15 +60,12 @@ float damping_factor;   // Interpolation-based damping: the fraction of
                              // intuitive and less poll-rate-dependent than
                              // the old multiplier-based approach
                              // (task 1 of the refinement plan).
-float saturation_strength;  // Soft-saturation strength for
-                              // tanhf(normalized * strength) * 128, where
-                              // normalized = float_stick / 128.0. Decoupled
-                              // from the gain curve (unlike the old
-                              // "knee" parameter, which was in the same
-                              // units as the stick value and changed
-                              // behaviour whenever the gain curve was
-                              // retuned). 1.0 = gentle, 2.0 = moderate
-                              // (default), 3.0 = barely saturates.
+float saturation_strength;  // Soft-saturation applied to the output
+                              // vector MAGNITUDE (not per-axis), so the
+                              // movement direction is preserved even as
+                              // the magnitude is clamped at the edge.
+                              // tanhf((mag/128) * strength) * 128.
+                              // 2.0 = moderate (default).
 
     bool invert_x;
     bool invert_y;
