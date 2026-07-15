@@ -73,8 +73,6 @@
 // The tunable bias parameters (alpha, error threshold, stationary sample
 // count) are now in GyroProfile (see gyro.h) and configurable via
 // gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples,
-// BiasStationaryGyro). The only remaining hardcoded define is the
-// debug-log rate limiter.
 #define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
 
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
@@ -106,8 +104,9 @@ static int g_calib_count = 0;          // accepted (stationary) samples
 static float g_calib_sum[3] = { 0, 0, 0 };
 static float g_bias[3] = { 0, 0, 0 };
 
-static bool g_is_stationary[3] = { false, false, false };
-static int g_stationary_count[3] = { 0, 0, 0 };
+static bool g_is_stationary = false;  // global: all axes |error| < threshold
+static int g_stationary_timer = 0;  // global: consecutive samples where the
+                                     // entire controller is stationary
 
 static bool g_runtime_enabled = true;
 static bool g_prev_l3r3_held = false;
@@ -162,7 +161,6 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_alpha = 0.01f;
     profile->bias_error_threshold = 0.08f;
     profile->bias_stationary_samples = 60;
-    profile->bias_stationary_gyro = 0.15f;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -235,7 +233,6 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
     ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
-    ini_table_get_entry_as_float(table, section, "BiasStationaryGyro", &profile->bias_stationary_gyro);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -263,8 +260,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
-    memset(g_is_stationary, 0, sizeof(g_is_stationary));
-    memset(g_stationary_count, 0, sizeof(g_stationary_count));
+    g_is_stationary = false;
+    g_stationary_timer = 0;
     g_runtime_enabled = true;
     g_prev_l3r3_held = false;
     g_touchpad_hold_count = 0;
@@ -293,8 +290,8 @@ static void start_recalibration(void) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
-    memset(g_is_stationary, 0, sizeof(g_is_stationary));
-    memset(g_stationary_count, 0, sizeof(g_stationary_count));
+    g_is_stationary = false;
+    g_stationary_timer = 0;
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
     g_yaw_in_dz = false;
@@ -327,21 +324,6 @@ static int clamp_int(int v, int lo, int hi) {
     return v;
 }
 
-// Per-axis stationary check for bias estimation: accel near gravity AND
-// a single gyro axis below the stationary threshold. Called independently
-// per axis so one noisy channel never blocks the others from converging.
-static bool bias_axis_is_stationary(float gval, float ax, float ay, float az) {
-    float accel_mag_sq = ax * ax + ay * ay + az * az;
-    if (accel_mag_sq > 1.0f) {
-        if (accel_mag_sq < STATIONARY_ACCEL_LOW_SQ || accel_mag_sq > STATIONARY_ACCEL_HIGH_SQ) {
-            return false;
-        }
-    }
-    if (fabsf(gval) >= g_profile.bias_stationary_gyro) {
-        return false;
-    }
-    return true;
-}
 
 // Task 6: apply dead-zone with hysteresis. Returns true if the rate should
 // be treated as zero (inside the dead zone).
@@ -487,41 +469,48 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     bool aiming = pData->analogButtons.l2 >= g_profile.trigger_threshold;
     set_lightbar(handle, aiming ? LB_ACTIVE : LB_INACTIVE);
     if (!aiming) {
-        // Bias estimation: only runs when the player is NOT aiming,
-        // making use of idle time (cutscenes, menus, running without
-        // aiming, etc.) to slowly refine the gyro bias. Each axis
-        // converges independently — a noisy gyro channel never blocks
-        // the others. Bias is NEVER updated while aiming (L2 held), so
-        // deliberate controller motion cannot corrupt the estimate.
+        // Bias estimation: only runs when NOT aiming. Uses global
+        // stationary detection (the controller is treated as a single
+        // physical object — all three axes must have |error| < threshold
+        // before ANY bias update can occur), then updates each axis
+        // independently from there.
         if (g_profile.drift_correction_enabled) {
-            float ax = pData->acceleration.x;
-            float ay = pData->acceleration.y;
-            float az = pData->acceleration.z;
-            float gyro_vals[3] = { gx, gy, gz };
+            float errors[3] = { gx - g_bias[0], gy - g_bias[1], gz - g_bias[2] };
 
+            // Global stationary check: all axes quiet simultaneously
+            bool all_still = true;
             for (int i = 0; i < 3; i++) {
-                float error = gyro_vals[i] - g_bias[i];
-                if (bias_axis_is_stationary(gyro_vals[i], ax, ay, az) &&
-                    fabsf(error) < g_profile.bias_error_threshold) {
-                    if (!g_is_stationary[i]) {
-                        g_is_stationary[i] = true;
-                        g_stationary_count[i] = 0;
-                    }
-                    g_stationary_count[i]++;
-                    if (g_stationary_count[i] >= g_profile.bias_stationary_samples) {
-                        g_bias[i] += g_profile.bias_alpha * error;
-                        g_bias_log_counter++;
-                        if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
-                            g_bias_log_counter = 0;
-                            log_info("bias: g=[%+.4f %+.4f %+.4f] bias=[%+.4f %+.4f %+.4f] err=[%+.4f %+.4f %+.4f]\n",
-                                     gx, gy, gz, g_bias[0], g_bias[1], g_bias[2],
-                                     gx - g_bias[0], gy - g_bias[1], gz - g_bias[2]);
+                if (fabsf(errors[i]) >= g_profile.bias_error_threshold) {
+                    all_still = false;
+                    break;
+                }
+            }
+
+            if (all_still) {
+                if (!g_is_stationary) {
+                    g_is_stationary = true;
+                    g_stationary_timer = 0;
+                }
+                g_stationary_timer++;
+                if (g_stationary_timer >= g_profile.bias_stationary_samples) {
+                    // Per-axis updates: each axis independently
+                    for (int i = 0; i < 3; i++) {
+                        if (fabsf(errors[i]) < g_profile.bias_error_threshold) {
+                            g_bias[i] += g_profile.bias_alpha * errors[i];
                         }
                     }
-                } else {
-                    g_is_stationary[i] = false;
-                    g_stationary_count[i] = 0;
+                    g_bias_log_counter++;
+                    if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
+                        g_bias_log_counter = 0;
+                        log_info("bias: X raw=%+.4f bias=%+.4f err=%+.4f | Y raw=%+.4f bias=%+.4f err=%+.4f | Z raw=%+.4f bias=%+.4f err=%+.4f\n",
+                                 gx, g_bias[0], errors[0],
+                                 gy, g_bias[1], errors[1],
+                                 gz, g_bias[2], errors[2]);
+                    }
                 }
+            } else {
+                g_is_stationary = false;
+                g_stationary_timer = 0;
             }
         }
         g_float_stick_x = 0.0f;

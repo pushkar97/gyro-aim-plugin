@@ -256,7 +256,6 @@ DriftCorrectionEnabled = true
 BiasAlpha = 0.01
 BiasErrorThreshold = 0.08
 BiasStationarySamples = 60
-BiasStationaryGyro = 0.15
 
 [CUSA00001]
 ; Example: lower gain values for a title that needs less amplification,
