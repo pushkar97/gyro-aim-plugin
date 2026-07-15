@@ -254,8 +254,10 @@ YawFromZ = true
 YawTiltWeight = 0.3
 DriftCorrectionEnabled = true
 BiasAlpha = 0.01
-BiasErrorThreshold = 0.08
+BiasErrorThreshold = 0.05
 BiasStationarySamples = 60
+SensitivityH = 1.0
+SensitivityV = 1.0
 
 [CUSA00001]
 ; Example: lower gain values for a title that needs less amplification,

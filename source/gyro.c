@@ -82,7 +82,10 @@
 // won't be updated (per-axis gate), but the timer still advances — once
 // the axis drifts back within range it will be updated on the same timer
 // rather than restarting from zero.
-#define BIAS_GLOBAL_STILL_THRESHOLD 0.20f
+#define BIAS_GLOBAL_STILL_THRESHOLD 0.10f  // rad/s; global "controller still?"
+                                            // check. Wider than per-axis to
+                                            // avoid deadlock when one axis
+                                            // has drifted.
 
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
 #define STATIONARY_ACCEL_LOW_SQ \
@@ -125,7 +128,10 @@ static bool g_recal_armed = true;
 
 static LightbarState g_lightbar_state = LB_UNSET;
 
-static int g_bias_log_counter = 0;  // rate-limit bias estimation logs
+static int g_bias_log_counter = 0;
+
+static int g_l2_release_samples = 0;  // consecutive samples L2 released
+#define L2_RELEASE_RESET_SAMPLES 120   // hard-reset after ~2s of release
 
 static GyroDebug g_debug;
 
@@ -167,8 +173,10 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->yaw_tilt_weight = 0.0f;
     profile->drift_correction_enabled = true;
     profile->bias_alpha = 0.01f;
-    profile->bias_error_threshold = 0.08f;
+    profile->bias_error_threshold = 0.05f;
     profile->bias_stationary_samples = 60;
+    profile->sensitivity_h = 1.0f;
+    profile->sensitivity_v = 1.0f;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -241,6 +249,8 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
     ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
+    ini_table_get_entry_as_float(table, section, "SensitivityH", &profile->sensitivity_h);
+    ini_table_get_entry_as_float(table, section, "SensitivityV", &profile->sensitivity_v);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -398,6 +408,11 @@ static void process_vector(float yaw, float pitch,
         float raw_x = norm_x * sat_mag;
         float raw_y = norm_y * sat_mag;
 
+        // Per-axis sensitivity scaling (applied after all vector
+        // processing — independent of deadzone/gain/saturation)
+        raw_x *= g_profile.sensitivity_h;
+        raw_y *= g_profile.sensitivity_v;
+
         // Per-axis output smoothing (EMA)
         if (alpha < 1.0f) {
             *float_stick_x += alpha * (raw_x - *float_stick_x);
@@ -536,10 +551,14 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                     g_bias_log_counter++;
                     if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
                         g_bias_log_counter = 0;
-                        log_info("bias: X raw=%+.4f bias=%+.4f err=%+.4f | Y raw=%+.4f bias=%+.4f err=%+.4f | Z raw=%+.4f bias=%+.4f err=%+.4f\n",
+                        float dyaw  = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
+                        float dpitch = gx - g_bias[0];
+                        float dmag = sqrtf(dyaw * dyaw + dpitch * dpitch);
+                        log_info("bias: X raw=%+.4f bias=%+.4f err=%+.4f | Y raw=%+.4f bias=%+.4f err=%+.4f | Z raw=%+.4f bias=%+.4f err=%+.4f | yaw=%+.4f pitch=%+.4f mag=%.4f\n",
                                  gx, g_bias[0], errors[0],
                                  gy, g_bias[1], errors[1],
-                                 gz, g_bias[2], errors[2]);
+                                 gz, g_bias[2], errors[2],
+                                 dyaw, dpitch, dmag);
                     }
                 }
             } else {
@@ -547,12 +566,28 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                 g_stationary_timer = 0;
             }
         }
-        g_float_stick_x = 0.0f;
-        g_float_stick_y = 0.0f;
+        // Damped L2 release: decay float_stick toward zero instead of
+        // snapping instantly. Feathering L2 then feels smooth — the
+        // stick picks up roughly where it left off rather than
+        // restarting from zero. After L2_RELEASE_RESET_SAMPLES of
+        // continuous release (~2 seconds), hard-reset to zero to prevent
+        // stale values from accumulating indefinitely.
+        g_float_stick_x += (0.0f - g_float_stick_x) * g_profile.damping_factor;
+        g_float_stick_y += (0.0f - g_float_stick_y) * g_profile.damping_factor;
+        g_l2_release_samples++;
+        if (g_l2_release_samples >= L2_RELEASE_RESET_SAMPLES) {
+            g_float_stick_x = 0.0f;
+            g_float_stick_y = 0.0f;
+            g_l2_release_samples = 0;
+        }
         return;
     }
 
     // --- Response model: vector-based (gain curve -> DeadZoneBias -> saturation -> EMA) -
+    // L2 is pressed — reset the release counter so the next release-to-
+    // damping cycle starts fresh.
+    g_l2_release_samples = 0;
+
     // The yaw/pitch pair is treated as a 2D rotation vector: the magnitude
     // determines speed, the normalized vector preserves the user's intended
     // direction. Diagonal movement now feels identical to pure

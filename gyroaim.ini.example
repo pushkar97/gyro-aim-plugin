@@ -16,8 +16,10 @@ YawFromZ = true
 YawTiltWeight = 0.3
 DriftCorrectionEnabled = true
 BiasAlpha = 0.01
-BiasErrorThreshold = 0.08
+BiasErrorThreshold = 0.05
 BiasStationarySamples = 60
+SensitivityH = 1.0
+SensitivityV = 1.0
 
 ; Example per-title override. Replace CUSA00001 with a real title ID
 ; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).

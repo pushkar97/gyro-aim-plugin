@@ -107,6 +107,12 @@ float saturation_strength;  // Soft-saturation applied to the output
                              // before bias estimation begins (60
                              // default, ~250ms at 250Hz / ~1s at 60Hz).
                              // Prevents transient-motion corruption.
+    float sensitivity_h;         // 1.0 = no scaling. Applied to stick_x
+                             // AFTER vector processing and BEFORE output
+                             // EMA smoothing. Simple output multiplier
+                             // independent of deadzone/gain/saturation.
+    float sensitivity_v;         // 1.0 = no scaling. Same as above for
+                             // stick_y.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI
