@@ -75,6 +75,15 @@
 // gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples,
 #define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
 
+// Global stationary detection uses a wider threshold than per-axis
+// updates: the global check only asks "is the controller being actively
+// swung around?" so the timer can accumulate even while some axes have
+// drifted beyond the per-axis threshold. If an axis has drifted, it
+// won't be updated (per-axis gate), but the timer still advances — once
+// the axis drifts back within range it will be updated on the same timer
+// rather than restarting from zero.
+#define BIAS_GLOBAL_STILL_THRESHOLD 0.20f
+
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
 #define STATIONARY_ACCEL_LOW_SQ \
     ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
@@ -499,10 +508,13 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         if (g_profile.drift_correction_enabled) {
             float errors[3] = { gx - g_bias[0], gy - g_bias[1], gz - g_bias[2] };
 
-            // Global stationary check: all axes quiet simultaneously
+            // Global stationary check: wide threshold — just asking "is the
+            // controller NOT being actively swung around?" so the timer
+            // can accumulate even while some axes have drifted beyond
+            // the per-axis update threshold.
             bool all_still = true;
             for (int i = 0; i < 3; i++) {
-                if (fabsf(errors[i]) >= g_profile.bias_error_threshold) {
+                if (fabsf(errors[i]) >= BIAS_GLOBAL_STILL_THRESHOLD) {
                     all_still = false;
                     break;
                 }
