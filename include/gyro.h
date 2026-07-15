@@ -112,6 +112,13 @@ float saturation_strength;  // Soft-saturation strength for
                              // before bias estimation begins (60
                              // default, ~250ms at 250Hz / ~1s at 60Hz).
                              // Prevents transient-motion corruption.
+    float bias_stationary_gyro;   // rad/s (0.15 default). Raw gyro must be
+                             // below this for the controller to be
+                             // considered stationary. Configurable
+                             // because the resting gyro noise floor
+                             // differs across individual controllers
+                             // and positions (flat table vs vertical
+                             // vs hand-held).
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

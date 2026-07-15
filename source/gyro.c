@@ -72,16 +72,9 @@
 //
 // The tunable bias parameters (alpha, error threshold, stationary sample
 // count) are now in GyroProfile (see gyro.h) and configurable via
-// gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples).
-// These remaining defines are non-user-facing infrastructure.
-#define BIAS_STATIONARY_GYRO_THRESHOLD 0.15f  // rad/s; raw gyro must be below
-                                               // this for the controller to be
-                                               // considered stationary. Must be
-                                               // generous enough to pass with
-                                               // natural hand tremor when
-                                               // holding the controller in a
-                                               // resting position (not just
-                                               // flat on a table).
+// gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples,
+// BiasStationaryGyro). The only remaining hardcoded define is the
+// debug-log rate limiter.
 #define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
 
 #define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
@@ -169,6 +162,7 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_alpha = 0.01f;
     profile->bias_error_threshold = 0.08f;
     profile->bias_stationary_samples = 60;
+    profile->bias_stationary_gyro = 0.15f;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -241,6 +235,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
     ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
+    ini_table_get_entry_as_float(table, section, "BiasStationaryGyro", &profile->bias_stationary_gyro);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -342,7 +337,7 @@ static bool bias_axis_is_stationary(float gval, float ax, float ay, float az) {
             return false;
         }
     }
-    if (fabsf(gval) >= BIAS_STATIONARY_GYRO_THRESHOLD) {
+    if (fabsf(gval) >= g_profile.bias_stationary_gyro) {
         return false;
     }
     return true;
