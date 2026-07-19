@@ -1,0 +1,20 @@
+[default]
+Enabled = true
+DeadZone = 0.008
+DeadZoneBias = 12
+TriggerThreshold = 250
+GainRates_H = 0.008 0.10 0.30 1.00 3.00 100.00
+GainValues_H = 250 200 150 120 60 25 15
+LowPassAlpha = 0.15
+DampingFactor = 0.50
+SaturationStrength = 5.25
+InvertX = true
+InvertY = true
+YawFromZ = false
+YawTiltWeight = 0.00
+DriftCorrectionEnabled = false
+BiasAlpha = 0.02
+BiasErrorThreshold = 0.12
+BiasStationarySamples = 30
+BiasStationaryGyro = 0.15
+

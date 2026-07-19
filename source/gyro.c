@@ -396,17 +396,33 @@ static void process_vector(float yaw, float pitch,
         // Gain lookup on vector magnitude
         float gain = gain_lookup(gain_rates, gain_values, gain_count, mag);
         float output_mag = gain * mag;
+	
+	float output_x = norm_x * output_mag;
+	float output_y = norm_y * output_mag;
 
-        // DeadZoneBias: minimum output magnitude (direction preserved)
-        if (dead_zone_bias > 0 && output_mag > 0.0f && output_mag < (float)dead_zone_bias) {
-            output_mag = (float)dead_zone_bias;
+	// Saturate per-axis, not on the combined vector length, so diagonal
+        // input can still reach full deflection on each axis independently.
+        float raw_x = tanhf((output_x / 128.0f) * saturation_strength) * 128.0f;
+	float raw_y = tanhf((output_y / 128.0f) * saturation_strength) * 128.0f;
+
+        //float raw_x = norm_x * sat_mag;
+        //float raw_y = norm_y * sat_mag;
+	
+	// FIX 2 (DeadZoneBias amplification): apply the floor to the
+        // *post-saturation* vector length, not the pre-saturation gain
+        // output. Previously the floor was set on output_mag before the
+        // tanh curve, so a configured floor of 20 came out the other side
+        // as ~71 (tanhf((20/128)*2)*128) — a 3.5x amplification that
+        // collapsed most of the usable range into a narrow top band.
+        // Scaling (raw_x, raw_y) as a vector (rather than flooring each
+        // axis independently) preserves direction and avoids injecting
+        // phantom movement into a near-zero secondary axis.
+        float sat_vec_mag = sqrtf(raw_x * raw_x + raw_y * raw_y);
+        if (dead_zone_bias > 0 && sat_vec_mag > 0.0f && sat_vec_mag < (float)dead_zone_bias) {
+            float scale = (float)dead_zone_bias / sat_vec_mag;
+            raw_x *= scale;
+            raw_y *= scale;
         }
-
-        // Saturation on the output magnitude (direction preserved)
-        float sat_mag = tanhf((output_mag / 128.0f) * saturation_strength) * 128.0f;
-
-        float raw_x = norm_x * sat_mag;
-        float raw_y = norm_y * sat_mag;
 
         // Per-axis sensitivity scaling (applied after all vector
         // processing — independent of deadzone/gain/saturation)
