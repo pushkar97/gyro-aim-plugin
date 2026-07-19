@@ -75,23 +75,26 @@
 // gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples,
 #define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
 
-// Global stationary detection uses a wider threshold than per-axis
-// updates: the global check only asks "is the controller being actively
-// swung around?" so the timer can accumulate even while some axes have
-// drifted beyond the per-axis threshold. If an axis has drifted, it
-// won't be updated (per-axis gate), but the timer still advances — once
-// the axis drifts back within range it will be updated on the same timer
-// rather than restarting from zero.
-#define BIAS_GLOBAL_STILL_THRESHOLD 0.10f  // rad/s; global "controller still?"
-                                            // check. Wider than per-axis to
-                                            // avoid deadlock when one axis
-                                            // has drifted.
-
-#define STATIONARY_ACCEL_TOLERANCE 0.5f  // m/s^2 around 9.80665
-#define STATIONARY_ACCEL_LOW_SQ \
-    ((9.80665f - STATIONARY_ACCEL_TOLERANCE) * (9.80665f - STATIONARY_ACCEL_TOLERANCE))
-#define STATIONARY_ACCEL_HIGH_SQ \
-    ((9.80665f + STATIONARY_ACCEL_TOLERANCE) * (9.80665f + STATIONARY_ACCEL_TOLERANCE))
+// --- Stillness detection ---------------------------------------------
+// "Is the controller physically still?" is detected from the RAW gyro
+// signal's own sample-to-sample variance, NOT from how close the raw
+// reading is to the current bias estimate. The previous (error-based)
+// approach created a deadlock: if the initial calibration missed by more
+// than the threshold on some axis, that axis's error could never shrink,
+// because being close to the current bias was the precondition for
+// moving it closer. A flat, low-jitter raw signal is evidence of a
+// stationary controller regardless of whether the bias estimate behind
+// it is currently correct.
+//
+// An accelerometer-based check (accel magnitude near gravity) was
+// considered but isn't used here: the calibration section below already
+// hit unreliable/zeroed accel data on some PS4 firmware variants and
+// dropped it for that reason. Same constraint applies here.
+#define BIAS_DELTA_EMA_ALPHA 0.2f             // smoothing for the delta estimator
+#define BIAS_STILLNESS_DELTA_THRESHOLD 0.01f  // rad/s; smoothed sample-to-sample
+                                               // delta below this = "flat".
+                                               // Starting point — validate
+                                               // against real hardware logs.
 
 #define STICK_CENTER 128
 #define STICK_MIN 0
@@ -116,9 +119,13 @@ static int g_calib_count = 0;          // accepted (stationary) samples
 static float g_calib_sum[3] = { 0, 0, 0 };
 static float g_bias[3] = { 0, 0, 0 };
 
-static bool g_is_stationary = false;  // global: all axes |error| < threshold
-static int g_stationary_timer = 0;  // global: consecutive samples where the
-                                     // entire controller is stationary
+static bool g_is_stationary = false;  // global: raw gyro signal is flat
+static int g_stationary_timer = 0;  // global: consecutive samples the raw
+                                     // gyro signal has been flat
+
+static float g_prev_gyro[3] = { 0, 0, 0 };  // previous raw sample, for delta calc
+static bool g_prev_gyro_valid = false;
+static float g_delta_ema[3] = { 0, 0, 0 };  // smoothed |sample-to-sample delta|, per axis
 
 static bool g_runtime_enabled = true;
 static bool g_prev_l3r3_held = false;
@@ -280,6 +287,8 @@ void gyro_state_init(const GyroProfile* profile) {
     memset(g_bias, 0, sizeof(g_bias));
     g_is_stationary = false;
     g_stationary_timer = 0;
+    g_prev_gyro_valid = false;
+    memset(g_delta_ema, 0, sizeof(g_delta_ema));
     g_runtime_enabled = true;
     g_prev_l3r3_held = false;
     g_touchpad_hold_count = 0;
@@ -309,6 +318,8 @@ static void start_recalibration(void) {
     memset(g_bias, 0, sizeof(g_bias));
     g_is_stationary = false;
     g_stationary_timer = 0;
+    g_prev_gyro_valid = false;
+    memset(g_delta_ema, 0, sizeof(g_delta_ema));
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
     g_vec_deadzone = false;
@@ -396,21 +407,18 @@ static void process_vector(float yaw, float pitch,
         // Gain lookup on vector magnitude
         float gain = gain_lookup(gain_rates, gain_values, gain_count, mag);
         float output_mag = gain * mag;
-	
-	float output_x = norm_x * output_mag;
-	float output_y = norm_y * output_mag;
 
-	// Saturate per-axis, not on the combined vector length, so diagonal
+        float output_x = norm_x * output_mag;
+        float output_y = norm_y * output_mag;
+
+        // Saturate per-axis, not on the combined vector length, so diagonal
         // input can still reach full deflection on each axis independently.
         float raw_x = tanhf((output_x / 128.0f) * saturation_strength) * 128.0f;
-	float raw_y = tanhf((output_y / 128.0f) * saturation_strength) * 128.0f;
+        float raw_y = tanhf((output_y / 128.0f) * saturation_strength) * 128.0f;
 
-        //float raw_x = norm_x * sat_mag;
-        //float raw_y = norm_y * sat_mag;
-	
-	// FIX 2 (DeadZoneBias amplification): apply the floor to the
-        // *post-saturation* vector length, not the pre-saturation gain
-        // output. Previously the floor was set on output_mag before the
+        // DeadZoneBias: apply the floor to the *post-saturation* vector
+        // length, not the pre-saturation gain output. Previously the
+        // floor was set on output_mag before the
         // tanh curve, so a configured floor of 20 came out the other side
         // as ~71 (tanhf((20/128)*2)*128) — a 3.5x amplification that
         // collapsed most of the usable range into a narrow top band.
@@ -537,32 +545,49 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         // before ANY bias update can occur), then updates each axis
         // independently from there.
         if (g_profile.drift_correction_enabled) {
-            float errors[3] = { gx - g_bias[0], gy - g_bias[1], gz - g_bias[2] };
+            float raw[3] = { gx, gy, gz };
 
-            // Global stationary check: wide threshold — just asking "is the
-            // controller NOT being actively swung around?" so the timer
-            // can accumulate even while some axes have drifted beyond
-            // the per-axis update threshold.
-            bool all_still = true;
-            for (int i = 0; i < 3; i++) {
-                if (fabsf(errors[i]) >= BIAS_GLOBAL_STILL_THRESHOLD) {
-                    all_still = false;
-                    break;
+            // Stillness: the raw signal itself must be flat, independent
+            // of the current bias estimate — see the comment on
+            // BIAS_STILLNESS_DELTA_THRESHOLD above for why this replaced
+            // an error-relative check.
+            bool all_flat = g_prev_gyro_valid;
+            if (g_prev_gyro_valid) {
+                for (int i = 0; i < 3; i++) {
+                    float delta = fabsf(raw[i] - g_prev_gyro[i]);
+                    g_delta_ema[i] += BIAS_DELTA_EMA_ALPHA * (delta - g_delta_ema[i]);
+                    if (g_delta_ema[i] >= BIAS_STILLNESS_DELTA_THRESHOLD) {
+                        all_flat = false;
+                    }
                 }
             }
+            g_prev_gyro[0] = gx;
+            g_prev_gyro[1] = gy;
+            g_prev_gyro[2] = gz;
+            g_prev_gyro_valid = true;
 
-            if (all_still) {
+            if (all_flat) {
                 if (!g_is_stationary) {
                     g_is_stationary = true;
                     g_stationary_timer = 0;
                 }
                 g_stationary_timer++;
                 if (g_stationary_timer >= g_profile.bias_stationary_samples) {
-                    // Per-axis updates: each axis independently
+                    // Confirmed flat independent of bias correctness, so
+                    // every axis converges here — including one whose
+                    // initial calibration missed badly.
+                    // bias_error_threshold now clamps the PER-SAMPLE
+                    // correction step (anti-windup) instead of gating
+                    // whether an update happens at all, so a badly-off
+                    // axis still converges — just gradually — instead of
+                    // being permanently stuck.
+                    float errors[3];
                     for (int i = 0; i < 3; i++) {
-                        if (fabsf(errors[i]) < g_profile.bias_error_threshold) {
-                            g_bias[i] += g_profile.bias_alpha * errors[i];
-                        }
+                        errors[i] = raw[i] - g_bias[i];
+                        float step = g_profile.bias_alpha * errors[i];
+                        if (step > g_profile.bias_error_threshold) step = g_profile.bias_error_threshold;
+                        if (step < -g_profile.bias_error_threshold) step = -g_profile.bias_error_threshold;
+                        g_bias[i] += step;
                     }
                     g_bias_log_counter++;
                     if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
@@ -599,7 +624,7 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         return;
     }
 
-    // --- Response model: vector-based (gain curve -> DeadZoneBias -> saturation -> EMA) -
+    // --- Response model: vector-based (gain curve -> saturation -> DeadZoneBias -> EMA) -
     // L2 is pressed — reset the release counter so the next release-to-
     // damping cycle starts fresh.
     g_l2_release_samples = 0;
