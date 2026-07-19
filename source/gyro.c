@@ -23,6 +23,13 @@
 // recalibration, so resuming aiming after a pause never partially blends
 // in a stale value from before the pause.
 //
+// Post-flick suppression: samples immediately following a fast flick
+// (magnitude >= FLICK_MAG_THRESHOLD) get a temporarily widened dead zone
+// and capped gain for FLICK_SUPPRESSION_SAMPLES samples, so the small
+// physical rebound after a fast stop doesn't get amplified into a
+// visible crosshair kick-back. See the FLICK_* constants and
+// process_vector() for details.
+//
 // Deliberate design choices carried over from earlier design/grilling
 // sessions:
 // - Velocity-based mapping: instantaneous corrected angular velocity feeds
@@ -110,6 +117,40 @@
 // L3+R3 toggle and touchpad-hold recalibrate hotkeys.
 #define RECALIBRATE_HOLD_SAMPLES 150
 
+// Post-flick suppression: a strong flick's deceleration/rebound is a real
+// physical motion (wrist/hand relaxing past neutral after a fast stop),
+// but the gain curve's low-end boost (tuned for precision aim) and
+// DeadZoneBias's guaranteed floor both end up amplifying that small
+// rebound far more than the flick that caused it -- the crosshair lands
+// on target and then visibly kicks back. When a sample's magnitude
+// crosses FLICK_MAG_THRESHOLD, a short cooldown is armed for the samples
+// that follow: the dead zone is temporarily widened and the gain is
+// capped, so a small unintentional rebound right after a flick doesn't
+// get boosted. Normal precision aim, which never crosses the flick
+// threshold, is completely unaffected.
+#define FLICK_MAG_THRESHOLD 1.00f          // rad/s; matches the gain curve's
+                                            // own breakpoint where gain
+                                            // flattens to its lowest value
+                                            // (kDefaultGainRates[4]), i.e.
+                                            // the pipeline already treats
+                                            // this rate as "fast."
+#define FLICK_SUPPRESSION_SAMPLES 12       // cooldown length after a flick
+                                            // ends. Starting point -- tune
+                                            // against real flick footage.
+#define FLICK_SUPPRESSION_DEADZONE_SCALE 5.0f  // dead_zone multiplier during
+                                                // cooldown (0.02 -> 0.10
+                                                // with defaults). Still far
+                                                // below a real follow-up
+                                                // flick's magnitude, so an
+                                                // intentional quick retarget
+                                                // is not swallowed.
+#define FLICK_SUPPRESSION_GAIN_CAP 30.0f   // gain ceiling during cooldown --
+                                            // roughly the flick's own
+                                            // high-speed gain, so anything
+                                            // that does clear the widened
+                                            // dead zone isn't boosted as if
+                                            // it were slow, deliberate aim.
+
 typedef enum LightbarState { LB_UNSET = -1, LB_INACTIVE, LB_ACTIVE, LB_CALIBRATING } LightbarState;
 
 static GyroProfile g_profile;
@@ -139,6 +180,9 @@ static int g_bias_log_counter = 0;
 
 static int g_l2_release_samples = 0;  // consecutive samples L2 released
 #define L2_RELEASE_RESET_SAMPLES 120   // hard-reset after ~2s of release
+
+static int g_flick_suppress_timer = 0;  // samples remaining in the
+                                         // post-flick suppression cooldown
 
 static GyroDebug g_debug;
 
@@ -297,6 +341,7 @@ void gyro_state_init(const GyroProfile* profile) {
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
     g_vec_deadzone = false;
+    g_flick_suppress_timer = 0;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -323,6 +368,7 @@ static void start_recalibration(void) {
     g_float_stick_x = 0.0f;
     g_float_stick_y = 0.0f;
     g_vec_deadzone = false;
+    g_flick_suppress_timer = 0;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -394,8 +440,28 @@ static void process_vector(float yaw, float pitch,
                             float dead_zone, float saturation_strength, int dead_zone_bias) {
     float mag = sqrtf(yaw * yaw + pitch * pitch);
 
+    // Post-flick suppression state machine (see FLICK_* constants above).
+    // A sample at or above FLICK_MAG_THRESHOLD is the flick itself and is
+    // never suppressed, regardless of how many consecutive samples it
+    // spans -- it (re)arms the cooldown for whatever comes after it ends.
+    // Once mag drops back below the threshold, suppress_this_sample goes
+    // true for FLICK_SUPPRESSION_SAMPLES samples, covering the
+    // deceleration/rebound tail without touching normal precision aim,
+    // which never crosses the threshold in the first place.
+    bool is_flick_sample = (mag >= FLICK_MAG_THRESHOLD);
+    bool suppress_this_sample = (!is_flick_sample) && (g_flick_suppress_timer > 0);
+    if (is_flick_sample) {
+        g_flick_suppress_timer = FLICK_SUPPRESSION_SAMPLES;
+    } else if (g_flick_suppress_timer > 0) {
+        g_flick_suppress_timer--;
+    }
+
+    float effective_dead_zone = suppress_this_sample
+                                     ? dead_zone * FLICK_SUPPRESSION_DEADZONE_SCALE
+                                     : dead_zone;
+
     // Vector deadzone with hysteresis on magnitude
-    if (vec_deadzone_with_hysteresis(mag, dead_zone, &g_vec_deadzone)) {
+    if (vec_deadzone_with_hysteresis(mag, effective_dead_zone, &g_vec_deadzone)) {
         mag = 0.0f;
     }
 
@@ -406,6 +472,9 @@ static void process_vector(float yaw, float pitch,
 
         // Gain lookup on vector magnitude
         float gain = gain_lookup(gain_rates, gain_values, gain_count, mag);
+        if (suppress_this_sample && gain > FLICK_SUPPRESSION_GAIN_CAP) {
+            gain = FLICK_SUPPRESSION_GAIN_CAP;
+        }
         float output_mag = gain * mag;
 
         float output_x = norm_x * output_mag;
@@ -621,6 +690,10 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
             g_float_stick_y = 0.0f;
             g_l2_release_samples = 0;
         }
+        // A flick's cooldown is only meaningful within the aiming session
+        // that produced it — clear it immediately on release rather than
+        // letting it carry into whatever happens next time L2 is pressed.
+        g_flick_suppress_timer = 0;
         return;
     }
 
