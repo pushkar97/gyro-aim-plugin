@@ -98,26 +98,27 @@ float saturation_strength;  // Soft-saturation applied to the output
                              // requires several seconds of stationary
                              // controller time to produce a noticeable
                              // change. Lower = more conservative.
-    float bias_error_threshold;  // rad/s (0.05 default). |raw - bias|
-                             // must be below this before bias is updated.
-                             // Only nudges the bias when it's already
-                             // close — deliberate motion is never
-                             // accidentally learned as bias.
+    float bias_max_correction_step;  // rad/s (0.05 default). Maximum
+                              // per-step correction applied to the bias
+                              // estimate during a single stationary
+                              // window. Clamps alpha * error so a
+                              // badly-off axis converges gradually
+                              // instead of jumping.
     int bias_stationary_samples; // consecutive still samples required
-                             // before bias estimation begins (60
-                             // default, ~250ms at 250Hz / ~1s at 60Hz).
-                             // Prevents transient-motion corruption.
+                              // before bias estimation begins (60
+                              // default, ~250ms at 250Hz / ~1s at 60Hz).
+                              // Prevents transient-motion corruption.
     float bias_delta_ema_alpha;  // EMA smoothing factor (0.2 default) for
-                             // the per-axis sample-to-sample delta used
-                             // to detect stillness. Stillness is judged
-                             // from the raw gyro signal's own flatness,
-                             // NOT from distance to the current bias
-                             // estimate — the latter can deadlock if the
-                             // initial calibration missed on an axis,
-                             // since being close to a wrong bias would
-                             // never happen. Higher = the delta estimate
-                             // reacts faster to new motion/stillness but
-                             // is noisier.
+                              // the per-axis sample-to-sample delta used
+                              // to detect stillness. Stillness is judged
+                              // from the raw gyro signal's own flatness,
+                              // NOT from distance to the current bias
+                              // estimate — the latter can deadlock if the
+                              // initial calibration missed on an axis,
+                              // since being close to a wrong bias would
+                              // never happen. Higher = the delta estimate
+                              // reacts faster to new motion/stillness but
+                              // is noisier.
     float bias_stillness_delta_threshold; // rad/s (0.01 default). The
                              // smoothed per-axis delta must stay below
                              // this for a sample to count as "flat".
@@ -156,17 +157,16 @@ float saturation_strength;  // Soft-saturation applied to the output
                               // trigger often contain residual hand
                               // settling and micro-adjustments that
                               // look stationary but aren't.
-    float bias_drift_accum_threshold; // rad/s*samples (0.5 default). After
+    float bias_drift_accum_threshold; // rad/s (0.01 default). After
                               // the stationary timer elapses, the
-                              // accumulated bias-corrected error
-                              // (running sum of raw[i] - bias[i]) is
-                              // checked per-axis. Sensor noise tends
-                              // to cancel out over time (~sqrt(N)),
-                              // while sustained slow motion accumulates
-                              // linearly (~N). If any axis exceeds this
-                              // threshold, the sample window is rejected
-                              // — the controller was slowly drifting, not
-                              // truly still.
+                              // per-axis accumulated bias-corrected
+                              // error is divided by the window size to
+                              // get an average error rate. Sensor noise
+                              // cancels out (~0 mean), while sustained
+                              // slow motion produces a consistent
+                              // non-zero average. If any axis exceeds
+                              // this threshold, the window is rejected.
+                              // Independent of BiasStationarySamples.
     float sensitivity_h;         // 1.0 = no scaling. Applied to stick_x
                              // AFTER vector processing and BEFORE output
                              // EMA smoothing. Simple output multiplier

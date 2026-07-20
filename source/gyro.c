@@ -79,7 +79,7 @@
 //
 // The tunable bias parameters (alpha, error threshold, stationary sample
 // count) are now in GyroProfile (see gyro.h) and configurable via
-// gyroaim.ini (BiasAlpha, BiasErrorThreshold, BiasStationarySamples,
+// gyroaim.ini (BiasAlpha, BiasMaxCorrectionStep, BiasStationarySamples,
 #define BIAS_LOG_INTERVAL 60           // log every N successful bias updates
 
 // --- Stillness detection ---------------------------------------------
@@ -215,13 +215,13 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->yaw_tilt_weight = 0.0f;
     profile->drift_correction_enabled = true;
     profile->bias_alpha = 0.01f;
-    profile->bias_error_threshold = 0.05f;
+    profile->bias_max_correction_step = 0.05f;
     profile->bias_stationary_samples = 60;
     profile->bias_delta_ema_alpha = 0.2f;
     profile->bias_stillness_delta_threshold = 0.01f;
     profile->bias_stillness_magnitude_threshold = 0.20f;
     profile->bias_settle_samples = 50;
-    profile->bias_drift_accum_threshold = 0.5f;
+    profile->bias_drift_accum_threshold = 0.01f;
     profile->sensitivity_h = 1.0f;
     profile->sensitivity_v = 1.0f;
     profile->flick_mag_threshold = 1.00f;
@@ -296,7 +296,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "YawTiltWeight", &profile->yaw_tilt_weight);
     ini_table_get_entry_as_bool(table, section, "DriftCorrectionEnabled", &profile->drift_correction_enabled);
     ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
-    ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
+    ini_table_get_entry_as_float(table, section, "BiasMaxCorrectionStep", &profile->bias_max_correction_step);
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
     ini_table_get_entry_as_float(table, section, "BiasDeltaEmaAlpha", &profile->bias_delta_ema_alpha);
     ini_table_get_entry_as_float(table, section, "BiasStillnessDeltaThreshold", &profile->bias_stillness_delta_threshold);
@@ -734,13 +734,15 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                 }
                 g_stationary_timer++;
                 if (g_stationary_timer >= g_profile.bias_stationary_samples) {
-                    // Windowed drift check: if the accumulated error
-                    // has drifted significantly on any axis, the
-                    // controller was slowly moving — reject this
-                    // window and start fresh.
+                    // Windowed drift check: normalize accumulated error
+                    // by window size so the threshold is independent of
+                    // BiasStationarySamples. Noise cancels out over time
+                    // (zero-mean → low average); sustained drift does
+                    // not (consistent sign → high average).
                     bool drift_ok = true;
                     for (int i = 0; i < 3; i++) {
-                        if (fabsf(g_drift_acc[i]) >= g_profile.bias_drift_accum_threshold) {
+                        float avg_error = g_drift_acc[i] / (float)g_stationary_timer;
+                        if (fabsf(avg_error) >= g_profile.bias_drift_accum_threshold) {
                             drift_ok = false;
                             break;
                         }
@@ -750,8 +752,8 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                         for (int i = 0; i < 3; i++) {
                             errors[i] = raw[i] - g_bias[i];
                             float step = g_profile.bias_alpha * errors[i];
-                            if (step > g_profile.bias_error_threshold) step = g_profile.bias_error_threshold;
-                            if (step < -g_profile.bias_error_threshold) step = -g_profile.bias_error_threshold;
+                            if (step > g_profile.bias_max_correction_step) step = g_profile.bias_max_correction_step;
+                            if (step < -g_profile.bias_max_correction_step) step = -g_profile.bias_max_correction_step;
                             g_bias[i] += step;
                         }
                         g_bias_log_counter++;
@@ -767,9 +769,11 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                                      dyaw, dpitch, dmag);
                         }
                     }
-                    // Reset accumulator regardless — start fresh for the
-                    // next stationary window, whether or not this one
-                    // passed the drift check.
+                    // Consume the stationary window — reset both the
+                    // timer and the accumulator so the next bias update
+                    // requires a full fresh window, not just one more
+                    // sample.
+                    g_stationary_timer = 0;
                     memset(g_drift_acc, 0, sizeof(g_drift_acc));
                 }
             } else {
