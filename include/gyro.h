@@ -30,15 +30,15 @@ typedef struct GyroProfile {
     // * rate_magnitude. Linearly interpolated between (rate, gain) breakpoints.
     // A single curve applies regardless of movement direction — diagonal
     // movements use the same gain as pure horizontal/vertical at the same
-    // rotational speed. gain_rates_h/values_h serve as the active curve;
-    // gain_rates_v/values_v are stored for backwards compat with existing
-    // configs but are DEPRECATED in the response model (only H is used).
+    // rotational speed. This is the only gain curve in the response
+    // model: the vector-magnitude pipeline has no separate horizontal/
+    // vertical curve to apply (a prior gain_rates_v/gain_values_v pair
+    // was removed — it was parsed from config but never read by
+    // process_vector; per-axis feel is controlled via sensitivity_h/v
+    // below instead).
     float gain_rates_h[MAX_GAIN_POINTS];
     float gain_values_h[MAX_GAIN_POINTS];
     int gain_count_h;
-    float gain_rates_v[MAX_GAIN_POINTS];
-    float gain_values_v[MAX_GAIN_POINTS];
-    int gain_count_v;
 
     float lowpass_alpha;    // EMA on the mapped STICK OUTPUT (not the gyro
                              // input), applied while actively moving:
@@ -107,12 +107,55 @@ float saturation_strength;  // Soft-saturation applied to the output
                              // before bias estimation begins (60
                              // default, ~250ms at 250Hz / ~1s at 60Hz).
                              // Prevents transient-motion corruption.
+    float bias_delta_ema_alpha;  // EMA smoothing factor (0.2 default) for
+                             // the per-axis sample-to-sample delta used
+                             // to detect stillness. Stillness is judged
+                             // from the raw gyro signal's own flatness,
+                             // NOT from distance to the current bias
+                             // estimate — the latter can deadlock if the
+                             // initial calibration missed on an axis,
+                             // since being close to a wrong bias would
+                             // never happen. Higher = the delta estimate
+                             // reacts faster to new motion/stillness but
+                             // is noisier.
+    float bias_stillness_delta_threshold; // rad/s (0.01 default). The
+                             // smoothed per-axis delta must stay below
+                             // this for a sample to count as "flat".
     float sensitivity_h;         // 1.0 = no scaling. Applied to stick_x
                              // AFTER vector processing and BEFORE output
                              // EMA smoothing. Simple output multiplier
                              // independent of deadzone/gain/saturation.
     float sensitivity_v;         // 1.0 = no scaling. Same as above for
                              // stick_y.
+
+    // Post-flick suppression: a strong flick's deceleration/rebound is a
+    // real physical motion, but the gain curve's low-end boost (tuned for
+    // precision aim) and dead_zone_bias's guaranteed floor both end up
+    // amplifying that small rebound far more than the flick that caused
+    // it — the crosshair lands on target and then visibly kicks back.
+    // Samples immediately following a fast flick get a temporarily
+    // widened dead zone and capped gain for a short cooldown so the
+    // rebound doesn't get boosted. Normal precision aim, which never
+    // crosses flick_mag_threshold, is unaffected.
+    float flick_mag_threshold;   // rad/s (1.00 default). Vector magnitude
+                             // at/above which a sample counts as the
+                             // flick itself (never suppressed) rather
+                             // than a post-flick sample. Matches the
+                             // default gain curve's own breakpoint where
+                             // gain flattens to its lowest value.
+    int flick_suppression_samples;  // cooldown length in samples after a
+                             // flick ends (12 default). Starting point —
+                             // tune against real flick footage/logs.
+    float flick_suppression_deadzone_scale; // dead_zone multiplier during
+                             // the cooldown (5.0 default: 0.02 -> 0.10
+                             // with default DeadZone). Still far below a
+                             // real follow-up flick's magnitude, so an
+                             // intentional quick retarget isn't swallowed.
+    float flick_suppression_gain_cap; // gain ceiling during the cooldown
+                             // (30.0 default) — roughly the flick's own
+                             // high-speed gain, so anything that does
+                             // clear the widened dead zone isn't boosted
+                             // as if it were slow, deliberate aim.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

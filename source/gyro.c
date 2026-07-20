@@ -24,8 +24,8 @@
 // in a stale value from before the pause.
 //
 // Post-flick suppression: samples immediately following a fast flick
-// (magnitude >= FLICK_MAG_THRESHOLD) get a temporarily widened dead zone
-// and capped gain for FLICK_SUPPRESSION_SAMPLES samples, so the small
+// (magnitude >= GyroProfile.flick_mag_threshold) get a temporarily widened
+// dead zone and capped gain for flick_suppression_samples samples, so the small
 // physical rebound after a fast stop doesn't get amplified into a
 // visible crosshair kick-back. See the FLICK_* constants and
 // process_vector() for details.
@@ -97,11 +97,7 @@
 // considered but isn't used here: the calibration section below already
 // hit unreliable/zeroed accel data on some PS4 firmware variants and
 // dropped it for that reason. Same constraint applies here.
-#define BIAS_DELTA_EMA_ALPHA 0.2f             // smoothing for the delta estimator
-#define BIAS_STILLNESS_DELTA_THRESHOLD 0.01f  // rad/s; smoothed sample-to-sample
-                                               // delta below this = "flat".
-                                               // Starting point — validate
-                                               // against real hardware logs.
+// Tunables: GyroProfile.bias_delta_ema_alpha, .bias_stillness_delta_threshold.
 
 #define STICK_CENTER 128
 #define STICK_MIN 0
@@ -123,33 +119,13 @@
 // DeadZoneBias's guaranteed floor both end up amplifying that small
 // rebound far more than the flick that caused it -- the crosshair lands
 // on target and then visibly kicks back. When a sample's magnitude
-// crosses FLICK_MAG_THRESHOLD, a short cooldown is armed for the samples
+// crosses flick_mag_threshold, a short cooldown is armed for the samples
 // that follow: the dead zone is temporarily widened and the gain is
 // capped, so a small unintentional rebound right after a flick doesn't
 // get boosted. Normal precision aim, which never crosses the flick
 // threshold, is completely unaffected.
-#define FLICK_MAG_THRESHOLD 1.00f          // rad/s; matches the gain curve's
-                                            // own breakpoint where gain
-                                            // flattens to its lowest value
-                                            // (kDefaultGainRates[4]), i.e.
-                                            // the pipeline already treats
-                                            // this rate as "fast."
-#define FLICK_SUPPRESSION_SAMPLES 12       // cooldown length after a flick
-                                            // ends. Starting point -- tune
-                                            // against real flick footage.
-#define FLICK_SUPPRESSION_DEADZONE_SCALE 5.0f  // dead_zone multiplier during
-                                                // cooldown (0.02 -> 0.10
-                                                // with defaults). Still far
-                                                // below a real follow-up
-                                                // flick's magnitude, so an
-                                                // intentional quick retarget
-                                                // is not swallowed.
-#define FLICK_SUPPRESSION_GAIN_CAP 30.0f   // gain ceiling during cooldown --
-                                            // roughly the flick's own
-                                            // high-speed gain, so anything
-                                            // that does clear the widened
-                                            // dead zone isn't boosted as if
-                                            // it were slow, deliberate aim.
+// Tunables: GyroProfile.flick_mag_threshold, .flick_suppression_samples,
+// .flick_suppression_deadzone_scale, .flick_suppression_gain_cap.
 
 typedef enum LightbarState { LB_UNSET = -1, LB_INACTIVE, LB_ACTIVE, LB_CALIBRATING } LightbarState;
 
@@ -212,7 +188,6 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->dead_zone_bias = 20;
     profile->trigger_threshold = 250;
     set_default_gain(profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h);
-    set_default_gain(profile->gain_rates_v, profile->gain_values_v, &profile->gain_count_v);
     profile->lowpass_alpha = 0.5f;
     // Task 1: damping is now interpolation-based (fraction moved toward
     // zero per sample, not a multiplier). 0.12 ≈ the old *= 0.88 feel.
@@ -226,8 +201,14 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_alpha = 0.01f;
     profile->bias_error_threshold = 0.05f;
     profile->bias_stationary_samples = 60;
+    profile->bias_delta_ema_alpha = 0.2f;
+    profile->bias_stillness_delta_threshold = 0.01f;
     profile->sensitivity_h = 1.0f;
     profile->sensitivity_v = 1.0f;
+    profile->flick_mag_threshold = 1.00f;
+    profile->flick_suppression_samples = 12;
+    profile->flick_suppression_deadzone_scale = 5.0f;
+    profile->flick_suppression_gain_cap = 30.0f;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -285,8 +266,6 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
 
     load_gain_curve(table, section, "GainRates_H", "GainValues_H",
                      profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h);
-    load_gain_curve(table, section, "GainRates_V", "GainValues_V",
-                     profile->gain_rates_v, profile->gain_values_v, &profile->gain_count_v);
 
     ini_table_get_entry_as_float(table, section, "LowPassAlpha", &profile->lowpass_alpha);
     ini_table_get_entry_as_float(table, section, "DampingFactor", &profile->damping_factor);
@@ -300,8 +279,14 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "BiasAlpha", &profile->bias_alpha);
     ini_table_get_entry_as_float(table, section, "BiasErrorThreshold", &profile->bias_error_threshold);
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
+    ini_table_get_entry_as_float(table, section, "BiasDeltaEmaAlpha", &profile->bias_delta_ema_alpha);
+    ini_table_get_entry_as_float(table, section, "BiasStillnessDeltaThreshold", &profile->bias_stillness_delta_threshold);
     ini_table_get_entry_as_float(table, section, "SensitivityH", &profile->sensitivity_h);
     ini_table_get_entry_as_float(table, section, "SensitivityV", &profile->sensitivity_v);
+    ini_table_get_entry_as_float(table, section, "FlickMagThreshold", &profile->flick_mag_threshold);
+    ini_table_get_entry_as_int(table, section, "FlickSuppressionSamples", &profile->flick_suppression_samples);
+    ini_table_get_entry_as_float(table, section, "FlickSuppressionDeadzoneScale", &profile->flick_suppression_deadzone_scale);
+    ini_table_get_entry_as_float(table, section, "FlickSuppressionGainCap", &profile->flick_suppression_gain_cap);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -440,24 +425,25 @@ static void process_vector(float yaw, float pitch,
                             float dead_zone, float saturation_strength, int dead_zone_bias) {
     float mag = sqrtf(yaw * yaw + pitch * pitch);
 
-    // Post-flick suppression state machine (see FLICK_* constants above).
-    // A sample at or above FLICK_MAG_THRESHOLD is the flick itself and is
-    // never suppressed, regardless of how many consecutive samples it
-    // spans -- it (re)arms the cooldown for whatever comes after it ends.
-    // Once mag drops back below the threshold, suppress_this_sample goes
-    // true for FLICK_SUPPRESSION_SAMPLES samples, covering the
-    // deceleration/rebound tail without touching normal precision aim,
-    // which never crosses the threshold in the first place.
-    bool is_flick_sample = (mag >= FLICK_MAG_THRESHOLD);
+    // Post-flick suppression state machine (see GyroProfile.flick_* field
+    // comments in gyro.h). A sample at or above flick_mag_threshold is the
+    // flick itself and is never suppressed, regardless of how many
+    // consecutive samples it spans -- it (re)arms the cooldown for
+    // whatever comes after it ends. Once mag drops back below the
+    // threshold, suppress_this_sample goes true for
+    // flick_suppression_samples samples, covering the deceleration/
+    // rebound tail without touching normal precision aim, which never
+    // crosses the threshold in the first place.
+    bool is_flick_sample = (mag >= g_profile.flick_mag_threshold);
     bool suppress_this_sample = (!is_flick_sample) && (g_flick_suppress_timer > 0);
     if (is_flick_sample) {
-        g_flick_suppress_timer = FLICK_SUPPRESSION_SAMPLES;
+        g_flick_suppress_timer = g_profile.flick_suppression_samples;
     } else if (g_flick_suppress_timer > 0) {
         g_flick_suppress_timer--;
     }
 
     float effective_dead_zone = suppress_this_sample
-                                     ? dead_zone * FLICK_SUPPRESSION_DEADZONE_SCALE
+                                     ? dead_zone * g_profile.flick_suppression_deadzone_scale
                                      : dead_zone;
 
     // Vector deadzone with hysteresis on magnitude
@@ -472,8 +458,8 @@ static void process_vector(float yaw, float pitch,
 
         // Gain lookup on vector magnitude
         float gain = gain_lookup(gain_rates, gain_values, gain_count, mag);
-        if (suppress_this_sample && gain > FLICK_SUPPRESSION_GAIN_CAP) {
-            gain = FLICK_SUPPRESSION_GAIN_CAP;
+        if (suppress_this_sample && gain > g_profile.flick_suppression_gain_cap) {
+            gain = g_profile.flick_suppression_gain_cap;
         }
         float output_mag = gain * mag;
 
@@ -618,14 +604,14 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
 
             // Stillness: the raw signal itself must be flat, independent
             // of the current bias estimate — see the comment on
-            // BIAS_STILLNESS_DELTA_THRESHOLD above for why this replaced
-            // an error-relative check.
+            // GyroProfile.bias_stillness_delta_threshold in gyro.h for
+            // why this replaced an error-relative check.
             bool all_flat = g_prev_gyro_valid;
             if (g_prev_gyro_valid) {
                 for (int i = 0; i < 3; i++) {
                     float delta = fabsf(raw[i] - g_prev_gyro[i]);
-                    g_delta_ema[i] += BIAS_DELTA_EMA_ALPHA * (delta - g_delta_ema[i]);
-                    if (g_delta_ema[i] >= BIAS_STILLNESS_DELTA_THRESHOLD) {
+                    g_delta_ema[i] += g_profile.bias_delta_ema_alpha * (delta - g_delta_ema[i]);
+                    if (g_delta_ema[i] >= g_profile.bias_stillness_delta_threshold) {
                         all_flat = false;
                     }
                 }
