@@ -159,6 +159,22 @@ static int g_l2_release_samples = 0;  // consecutive samples L2 released
 
 static int g_flick_suppress_timer = 0;  // samples remaining in the
                                          // post-flick suppression cooldown
+static float g_flick_dir_yaw = 0.0f;   // normalized direction of last
+static float g_flick_dir_pitch = 0.0f; // detected flick, for rebound detection
+#define FLICK_REVERSAL_DOT -0.5f        // dot product below this = rebound
+                                         // (movement >120° away from flick)
+
+// Post-aiming settle delay: prevents post-trigger-release hand settling
+// from being learned as bias. Armed when L2 transitions aiming→not aiming.
+static int g_settle_timer = 0;
+
+// Windowed drift accumulator: running sum of (raw - bias) per axis during
+// stationary evaluation. Resets when stillness breaks or settle timer arms.
+// Noise cancels out (sqrt(N)); sustained slow motion accumulates (N).
+static float g_drift_acc[3] = { 0, 0, 0 };
+
+// Edge-detection: did the last sample have L2 pressed?
+static bool g_was_aiming = false;
 
 static GyroDebug g_debug;
 
@@ -203,6 +219,9 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_stationary_samples = 60;
     profile->bias_delta_ema_alpha = 0.2f;
     profile->bias_stillness_delta_threshold = 0.01f;
+    profile->bias_stillness_magnitude_threshold = 0.20f;
+    profile->bias_settle_samples = 50;
+    profile->bias_drift_accum_threshold = 0.5f;
     profile->sensitivity_h = 1.0f;
     profile->sensitivity_v = 1.0f;
     profile->flick_mag_threshold = 1.00f;
@@ -281,6 +300,9 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_int(table, section, "BiasStationarySamples", &profile->bias_stationary_samples);
     ini_table_get_entry_as_float(table, section, "BiasDeltaEmaAlpha", &profile->bias_delta_ema_alpha);
     ini_table_get_entry_as_float(table, section, "BiasStillnessDeltaThreshold", &profile->bias_stillness_delta_threshold);
+    ini_table_get_entry_as_float(table, section, "BiasStillnessMagnitudeThreshold", &profile->bias_stillness_magnitude_threshold);
+    ini_table_get_entry_as_int(table, section, "BiasSettleSamples", &profile->bias_settle_samples);
+    ini_table_get_entry_as_float(table, section, "BiasDriftAccumThreshold", &profile->bias_drift_accum_threshold);
     ini_table_get_entry_as_float(table, section, "SensitivityH", &profile->sensitivity_h);
     ini_table_get_entry_as_float(table, section, "SensitivityV", &profile->sensitivity_v);
     ini_table_get_entry_as_float(table, section, "FlickMagThreshold", &profile->flick_mag_threshold);
@@ -327,6 +349,11 @@ void gyro_state_init(const GyroProfile* profile) {
     g_float_stick_y = 0.0f;
     g_vec_deadzone = false;
     g_flick_suppress_timer = 0;
+    g_flick_dir_yaw = 0.0f;
+    g_flick_dir_pitch = 0.0f;
+    g_settle_timer = 0;
+    memset(g_drift_acc, 0, sizeof(g_drift_acc));
+    g_was_aiming = false;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -354,6 +381,11 @@ static void start_recalibration(void) {
     g_float_stick_y = 0.0f;
     g_vec_deadzone = false;
     g_flick_suppress_timer = 0;
+    g_flick_dir_yaw = 0.0f;
+    g_flick_dir_pitch = 0.0f;
+    g_settle_timer = 0;
+    memset(g_drift_acc, 0, sizeof(g_drift_acc));
+    g_was_aiming = false;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -425,22 +457,43 @@ static void process_vector(float yaw, float pitch,
                             float dead_zone, float saturation_strength, int dead_zone_bias) {
     float mag = sqrtf(yaw * yaw + pitch * pitch);
 
-    // Post-flick suppression state machine (see GyroProfile.flick_* field
-    // comments in gyro.h). A sample at or above flick_mag_threshold is the
-    // flick itself and is never suppressed, regardless of how many
-    // consecutive samples it spans -- it (re)arms the cooldown for
-    // whatever comes after it ends. Once mag drops back below the
-    // threshold, suppress_this_sample goes true for
-    // flick_suppression_samples samples, covering the deceleration/
-    // rebound tail without touching normal precision aim, which never
-    // crosses the threshold in the first place.
+    // Post-flick suppression state machine with directional rebound
+    // detection. A pure magnitude check can't tell the difference
+    // between a small rebound (opposite direction to the flick, low
+    // magnitude) and a small follow-up flick (same or new direction).
+    // Direction tracking fixes this:
+    //   1. When a flick is detected (mag ≥ threshold), save its
+    //      normalized direction.
+    //   2. During the cooldown, compare the current movement direction
+    //      to the flick direction via dot product.
+    //   3. Dot < FLICK_REVERSAL_DOT (−0.5, >120° away) = rebound →
+    //      suppress. Otherwise = new intentional movement → don't
+    //      suppress (and re-arm if it crosses the threshold).
     bool is_flick_sample = (mag >= g_profile.flick_mag_threshold);
-    bool suppress_this_sample = (!is_flick_sample) && (g_flick_suppress_timer > 0);
+    bool is_rebound = false;
     if (is_flick_sample) {
         g_flick_suppress_timer = g_profile.flick_suppression_samples;
+        // Record flick direction (normalized) for rebound detection
+        if (mag > 0.0f) {
+            g_flick_dir_yaw = yaw / mag;
+            g_flick_dir_pitch = pitch / mag;
+        } else {
+            g_flick_dir_yaw = 0.0f;
+            g_flick_dir_pitch = 0.0f;
+        }
     } else if (g_flick_suppress_timer > 0) {
         g_flick_suppress_timer--;
+        // Direction-based rebound check: is this sample moving roughly
+        // opposite to the flick that armed the cooldown?
+        if (mag > 0.0f && (g_flick_dir_yaw != 0.0f || g_flick_dir_pitch != 0.0f)) {
+            float norm_x = yaw / mag;
+            float norm_y = pitch / mag;
+            float dot = g_flick_dir_yaw * norm_x + g_flick_dir_pitch * norm_y;
+            is_rebound = (dot < FLICK_REVERSAL_DOT);
+        }
     }
+    bool suppress_this_sample = is_rebound;
+    g_debug.flick_suppress = suppress_this_sample ? 1 : 0;
 
     float effective_dead_zone = suppress_this_sample
                                      ? dead_zone * g_profile.flick_suppression_deadzone_scale
@@ -594,25 +647,56 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     bool aiming = pData->analogButtons.l2 >= g_profile.trigger_threshold;
     set_lightbar(handle, aiming ? LB_ACTIVE : LB_INACTIVE);
     if (!aiming) {
-        // Bias estimation: only runs when NOT aiming. Uses global
-        // stationary detection (the controller is treated as a single
-        // physical object — all three axes must have |error| < threshold
-        // before ANY bias update can occur), then updates each axis
-        // independently from there.
-        if (g_profile.drift_correction_enabled) {
+        // --- Post-aiming settle delay ---
+        // Arm on the transition from aiming to not-aiming. During the
+        // delay, skip ALL bias estimation — the moments immediately
+        // after releasing L2 are likely to contain residual hand
+        // settling that looks stationary but isn't.
+        if (g_was_aiming) {
+            g_settle_timer = g_profile.bias_settle_samples;
+            memset(g_drift_acc, 0, sizeof(g_drift_acc));
+        }
+        g_was_aiming = false;
+        if (g_settle_timer > 0) {
+            g_settle_timer--;
+        }
+
+        // Bias estimation: only runs when NOT aiming AND the settle
+        // delay has elapsed. Stillness is judged globally across all
+        // three axes (both the flat/low-jerk gate and the near-zero/
+        // magnitude gate must pass on every axis before ANY axis's
+        // bias is updated), then each axis is updated independently.
+        // An additional windowed-drift check (accumulated bias-corrected
+        // error over the stationary window) rejects sustained slow
+        // motion that the instantaneous gates can't distinguish from
+        // sensor noise — see the drift accumulator comment below.
+        if (g_profile.drift_correction_enabled && g_settle_timer == 0) {
             float raw[3] = { gx, gy, gz };
 
-            // Stillness: the raw signal itself must be flat, independent
-            // of the current bias estimate — see the comment on
-            // GyroProfile.bias_stillness_delta_threshold in gyro.h for
-            // why this replaced an error-relative check.
-            bool all_flat = g_prev_gyro_valid;
+            // Stillness requires two independent signals to agree:
+            //  1. Flat (low jerk): the delta check below. Catches
+            //     abrupt/jittery motion but, on its own, misses smooth
+            //     constant-rate rotation -- e.g. gently settling onto a
+            //     target has almost no sample-to-sample delta even
+            //     while genuinely moving.
+            //  2. Near zero (low magnitude): compared against a fixed
+            //     physical bound (bias_stillness_magnitude_threshold),
+            //     NOT the current bias estimate -- catches smooth
+            //     motion the delta check alone misses, without
+            //     reintroducing the old deadlock where a bad bias
+            //     estimate could never be corrected because "close to
+            //     the current bias" was the precondition for moving it.
+            // Both gates must pass. Missing real stillness only costs
+            // convergence speed; treating real motion as stillness
+            // corrupts the estimate -- this deliberately errs toward
+            // the former.
+            bool is_flat = g_prev_gyro_valid;
             if (g_prev_gyro_valid) {
                 for (int i = 0; i < 3; i++) {
                     float delta = fabsf(raw[i] - g_prev_gyro[i]);
                     g_delta_ema[i] += g_profile.bias_delta_ema_alpha * (delta - g_delta_ema[i]);
                     if (g_delta_ema[i] >= g_profile.bias_stillness_delta_threshold) {
-                        all_flat = false;
+                        is_flat = false;
                     }
                 }
             }
@@ -621,45 +705,80 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
             g_prev_gyro[2] = gz;
             g_prev_gyro_valid = true;
 
+            bool is_near_zero = true;
+            for (int i = 0; i < 3; i++) {
+                if (fabsf(raw[i]) >= g_profile.bias_stillness_magnitude_threshold) {
+                    is_near_zero = false;
+                    break;
+                }
+            }
+
+            bool all_flat = is_flat && is_near_zero;
+
             if (all_flat) {
+                // Accumulate bias-corrected error while the controller
+                // appears stationary. Sensor noise has roughly zero mean
+                // (random signs → sqrt(N) growth), while sustained slow
+                // motion has a consistent sign per axis (→ N growth).
+                // This windowed-accumulator check catches slow drift
+                // that the instantaneous flat/zero gates alone can't
+                // distinguish from sensor noise. The accumulator resets
+                // whenever stillness breaks or a window is consumed.
+                g_drift_acc[0] += raw[0] - g_bias[0];
+                g_drift_acc[1] += raw[1] - g_bias[1];
+                g_drift_acc[2] += raw[2] - g_bias[2];
+
                 if (!g_is_stationary) {
                     g_is_stationary = true;
                     g_stationary_timer = 0;
                 }
                 g_stationary_timer++;
                 if (g_stationary_timer >= g_profile.bias_stationary_samples) {
-                    // Confirmed flat independent of bias correctness, so
-                    // every axis converges here — including one whose
-                    // initial calibration missed badly.
-                    // bias_error_threshold now clamps the PER-SAMPLE
-                    // correction step (anti-windup) instead of gating
-                    // whether an update happens at all, so a badly-off
-                    // axis still converges — just gradually — instead of
-                    // being permanently stuck.
-                    float errors[3];
+                    // Windowed drift check: if the accumulated error
+                    // has drifted significantly on any axis, the
+                    // controller was slowly moving — reject this
+                    // window and start fresh.
+                    bool drift_ok = true;
                     for (int i = 0; i < 3; i++) {
-                        errors[i] = raw[i] - g_bias[i];
-                        float step = g_profile.bias_alpha * errors[i];
-                        if (step > g_profile.bias_error_threshold) step = g_profile.bias_error_threshold;
-                        if (step < -g_profile.bias_error_threshold) step = -g_profile.bias_error_threshold;
-                        g_bias[i] += step;
+                        if (fabsf(g_drift_acc[i]) >= g_profile.bias_drift_accum_threshold) {
+                            drift_ok = false;
+                            break;
+                        }
                     }
-                    g_bias_log_counter++;
-                    if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
-                        g_bias_log_counter = 0;
-                        float dyaw  = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
-                        float dpitch = gx - g_bias[0];
-                        float dmag = sqrtf(dyaw * dyaw + dpitch * dpitch);
-                        log_info("bias: X raw=%+.4f bias=%+.4f err=%+.4f | Y raw=%+.4f bias=%+.4f err=%+.4f | Z raw=%+.4f bias=%+.4f err=%+.4f | yaw=%+.4f pitch=%+.4f mag=%.4f\n",
-                                 gx, g_bias[0], errors[0],
-                                 gy, g_bias[1], errors[1],
-                                 gz, g_bias[2], errors[2],
-                                 dyaw, dpitch, dmag);
+                    if (drift_ok) {
+                        float errors[3];
+                        for (int i = 0; i < 3; i++) {
+                            errors[i] = raw[i] - g_bias[i];
+                            float step = g_profile.bias_alpha * errors[i];
+                            if (step > g_profile.bias_error_threshold) step = g_profile.bias_error_threshold;
+                            if (step < -g_profile.bias_error_threshold) step = -g_profile.bias_error_threshold;
+                            g_bias[i] += step;
+                        }
+                        g_bias_log_counter++;
+                        if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
+                            g_bias_log_counter = 0;
+                            float dyaw  = (g_profile.yaw_from_z ? gz : gy) - g_bias[g_profile.yaw_from_z ? 2 : 1];
+                            float dpitch = gx - g_bias[0];
+                            float dmag = sqrtf(dyaw * dyaw + dpitch * dpitch);
+                            log_info("bias: X raw=%+.4f bias=%+.4f err=%+.4f | Y raw=%+.4f bias=%+.4f err=%+.4f | Z raw=%+.4f bias=%+.4f err=%+.4f | yaw=%+.4f pitch=%+.4f mag=%.4f\n",
+                                     gx, g_bias[0], errors[0],
+                                     gy, g_bias[1], errors[1],
+                                     gz, g_bias[2], errors[2],
+                                     dyaw, dpitch, dmag);
+                        }
                     }
+                    // Reset accumulator regardless — start fresh for the
+                    // next stationary window, whether or not this one
+                    // passed the drift check.
+                    memset(g_drift_acc, 0, sizeof(g_drift_acc));
                 }
             } else {
                 g_is_stationary = false;
                 g_stationary_timer = 0;
+                // Stillness broken — reset drift accumulator. Any
+                // accumulated error from a partially-still interval
+                // is stale the moment the controller moves again.
+                memset(g_drift_acc, 0, sizeof(g_drift_acc));
             }
         }
         // Damped L2 release: decay float_stick toward zero instead of
@@ -680,12 +799,15 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         // that produced it — clear it immediately on release rather than
         // letting it carry into whatever happens next time L2 is pressed.
         g_flick_suppress_timer = 0;
+        g_flick_dir_yaw = 0.0f;
+        g_flick_dir_pitch = 0.0f;
         return;
     }
 
-    // --- Response model: vector-based (gain curve -> saturation -> DeadZoneBias -> EMA) -
-    // L2 is pressed — reset the release counter so the next release-to-
-    // damping cycle starts fresh.
+    // --- Response model: vector-based (gain curve -> saturation -> DeadZoneBias -> EMA) ---
+    // L2 is pressed — update edge detector and reset the release counter
+    // so the next release-to-damping cycle starts fresh.
+    g_was_aiming = true;
     g_l2_release_samples = 0;
 
     // The yaw/pitch pair is treated as a 2D rotation vector: the magnitude

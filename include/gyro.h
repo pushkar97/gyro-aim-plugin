@@ -121,6 +121,52 @@ float saturation_strength;  // Soft-saturation applied to the output
     float bias_stillness_delta_threshold; // rad/s (0.01 default). The
                              // smoothed per-axis delta must stay below
                              // this for a sample to count as "flat".
+                             // This alone only catches abrupt/jittery
+                             // motion (it measures sample-to-sample
+                             // change, not the reading itself) -- a
+                             // smooth, constant-rate rotation such as
+                             // gently settling onto a target has almost
+                             // no delta and can slip through undetected.
+                             // See bias_stillness_magnitude_threshold,
+                             // which is required in addition.
+    float bias_stillness_magnitude_threshold; // rad/s (0.20 default). The
+                             // raw (bias-corrected) reading's magnitude
+                             // must ALSO stay below this for a sample to
+                             // count as stationary -- this is the check
+                             // that catches smooth, low-jerk motion the
+                             // delta check alone would miss. Deliberately
+                             // compared against a fixed physical bound,
+                             // not the current bias estimate, so it can't
+                             // reintroduce the old deadlock where a bad
+                             // initial calibration prevents itself from
+                             // ever being corrected. Should be set well
+                             // above plausible DS4 zero-rate offset
+                             // (typically ~0.05-0.10 rad/s) and well
+                             // below any real intentional movement.
+                             // Both this AND the delta check must pass
+                             // for a sample to count as still --
+                             // deliberately biased toward missing
+                              // legitimate stillness (costs convergence
+                              // speed only) over misreading real motion
+                              // as stillness (corrupts the estimate).
+    int bias_settle_samples;     // samples after L2 release before bias
+                              // estimation is allowed to resume (50
+                              // default, ~200ms at 250Hz). The moments
+                              // immediately after releasing the aim
+                              // trigger often contain residual hand
+                              // settling and micro-adjustments that
+                              // look stationary but aren't.
+    float bias_drift_accum_threshold; // rad/s*samples (0.5 default). After
+                              // the stationary timer elapses, the
+                              // accumulated bias-corrected error
+                              // (running sum of raw[i] - bias[i]) is
+                              // checked per-axis. Sensor noise tends
+                              // to cancel out over time (~sqrt(N)),
+                              // while sustained slow motion accumulates
+                              // linearly (~N). If any axis exceeds this
+                              // threshold, the sample window is rejected
+                              // — the controller was slowly drifting, not
+                              // truly still.
     float sensitivity_h;         // 1.0 = no scaling. Applied to stick_x
                              // AFTER vector processing and BEFORE output
                              // EMA smoothing. Simple output multiplier
@@ -183,6 +229,7 @@ typedef struct GyroDebug {
     float bias[3];    // current bias[0], bias[1], bias[2]
     float yaw;        // post-bias, post-deadzone, post-invert yaw
     float pitch;      // post-bias, post-deadzone, post-invert pitch
+    int flick_suppress;  // 0 = inactive, 1 = currently suppressing rebound
 } GyroDebug;
 
 GyroDebug gyro_get_debug(void);
