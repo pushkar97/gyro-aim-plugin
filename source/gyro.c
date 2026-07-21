@@ -457,23 +457,19 @@ static void process_vector(float yaw, float pitch,
                             float dead_zone, float saturation_strength, int dead_zone_bias) {
     float mag = sqrtf(yaw * yaw + pitch * pitch);
 
-    // Post-flick suppression state machine with directional rebound
-    // detection. A pure magnitude check can't tell the difference
-    // between a small rebound (opposite direction to the flick, low
-    // magnitude) and a small follow-up flick (same or new direction).
-    // Direction tracking fixes this:
-    //   1. When a flick is detected (mag ≥ threshold), save its
-    //      normalized direction.
-    //   2. During the cooldown, compare the current movement direction
-    //      to the flick direction via dot product.
-    //   3. Dot < FLICK_REVERSAL_DOT (−0.5, >120° away) = rebound →
-    //      suppress. Otherwise = new intentional movement → don't
-    //      suppress (and re-arm if it crosses the threshold).
+    // Post-flick suppression state machine. All samples whose magnitude
+    // is below flick_mag_threshold during the cooldown are suppressed
+    // (widened deadzone + capped gain). Direction tracking (is_rebound)
+    // is a diagnostic signal for the HUD — it flags samples moving
+    // opposite to the flick's direction — but does NOT gate suppression:
+    // both the deceleration tail (same direction) and the rebound
+    // (opposite direction) need to be suppressed for flick to work.
+    // If the user makes a genuine new flick during the cooldown
+    // (mag ≥ threshold), it re-arms as normal and is never suppressed.
     bool is_flick_sample = (mag >= g_profile.flick_mag_threshold);
     bool is_rebound = false;
     if (is_flick_sample) {
         g_flick_suppress_timer = g_profile.flick_suppression_samples;
-        // Record flick direction (normalized) for rebound detection
         if (mag > 0.0f) {
             g_flick_dir_yaw = yaw / mag;
             g_flick_dir_pitch = pitch / mag;
@@ -483,8 +479,7 @@ static void process_vector(float yaw, float pitch,
         }
     } else if (g_flick_suppress_timer > 0) {
         g_flick_suppress_timer--;
-        // Direction-based rebound check: is this sample moving roughly
-        // opposite to the flick that armed the cooldown?
+        // Diagnostic: is this sample moving opposite to the flick?
         if (mag > 0.0f && (g_flick_dir_yaw != 0.0f || g_flick_dir_pitch != 0.0f)) {
             float norm_x = yaw / mag;
             float norm_y = pitch / mag;
@@ -492,7 +487,7 @@ static void process_vector(float yaw, float pitch,
             is_rebound = (dot < FLICK_REVERSAL_DOT);
         }
     }
-    bool suppress_this_sample = is_rebound;
+    bool suppress_this_sample = (!is_flick_sample) && (g_flick_suppress_timer > 0);
     g_debug.flick_suppress = suppress_this_sample ? 1 : 0;
 
     float effective_dead_zone = suppress_this_sample
