@@ -219,7 +219,7 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_stationary_samples = 60;
     profile->bias_delta_ema_alpha = 0.2f;
     profile->bias_stillness_delta_threshold = 0.01f;
-    profile->bias_stillness_magnitude_threshold = 0.20f;
+    profile->bias_stillness_magnitude_threshold = 0.50f;
     profile->bias_settle_samples = 50;
     profile->bias_drift_accum_threshold = 0.01f;
     profile->sensitivity_h = 1.0f;
@@ -688,6 +688,9 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         // error over the stationary window) rejects sustained slow
         // motion that the instantaneous gates can't distinguish from
         // sensor noise — see the drift accumulator comment below.
+        g_debug.stillness = 0;
+        g_debug.bias_active = 0;
+
         if (g_profile.drift_correction_enabled && g_settle_timer == 0) {
             float raw[3] = { gx, gy, gz };
 
@@ -733,6 +736,8 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
 
             bool all_flat = is_flat && is_near_zero;
 
+            g_debug.stillness = all_flat ? 1 : 0;
+
             if (all_flat) {
                 // Accumulate bias-corrected error while the controller
                 // appears stationary. Sensor noise has roughly zero mean
@@ -751,6 +756,7 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                     g_stationary_timer = 0;
                 }
                 g_stationary_timer++;
+                g_debug.bias_active = g_stationary_timer;
                 if (g_stationary_timer >= g_profile.bias_stationary_samples) {
                     // Windowed drift check: normalize accumulated error
                     // by window size so the threshold is independent of
@@ -786,6 +792,20 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                                      gz, g_bias[2], errors[2],
                                      dyaw, dpitch, dmag);
                         }
+                    } else {
+                        g_debug.bias_active = 0;
+                        static int drift_fail_counter = 0;
+                        drift_fail_counter++;
+                        if (drift_fail_counter >= BIAS_LOG_INTERVAL) {
+                            drift_fail_counter = 0;
+                            float tmp_timer = (float)g_stationary_timer;
+                            float avg[3];
+                            avg[0] = g_drift_acc[0] / tmp_timer;
+                            avg[1] = g_drift_acc[1] / tmp_timer;
+                            avg[2] = g_drift_acc[2] / tmp_timer;
+                            log_info("bias: drift check FAILED (avg error X=%+.4f Y=%+.4f Z=%+.4f, threshold=%.4f)\n",
+                                     avg[0], avg[1], avg[2], g_profile.bias_drift_accum_threshold);
+                        }
                     }
                     // Consume the stationary window — reset both the
                     // timer and the accumulator so the next bias update
@@ -797,6 +817,7 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
             } else {
                 g_is_stationary = false;
                 g_stationary_timer = 0;
+                g_debug.bias_active = 0;
                 // Stillness broken — reset drift accumulator. Any
                 // accumulated error from a partially-still interval
                 // is stale the moment the controller moves again.

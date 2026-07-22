@@ -230,6 +230,8 @@ typedef struct GyroDebug {
     float yaw;        // post-bias, post-deadzone, post-invert yaw
     float pitch;      // post-bias, post-deadzone, post-invert pitch
     int flick_suppress;  // 0 = inactive, 1 = currently suppressing rebound
+    int stillness;       // 0 = not still, 1 = stillness gates passing (flat + near-zero)
+    int bias_active;     // 0 = bias estimation idle, 1 = stationary window accumulating
 } GyroDebug;
 
 GyroDebug gyro_get_debug(void);
