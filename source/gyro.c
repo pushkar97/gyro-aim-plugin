@@ -457,17 +457,39 @@ static void process_vector(float yaw, float pitch,
                             float dead_zone, float saturation_strength, int dead_zone_bias) {
     float mag = sqrtf(yaw * yaw + pitch * pitch);
 
-    // Post-flick suppression state machine. All samples whose magnitude
-    // is below flick_mag_threshold during the cooldown are suppressed
-    // (widened deadzone + capped gain). Direction tracking (is_rebound)
-    // is a diagnostic signal for the HUD — it flags samples moving
-    // opposite to the flick's direction — but does NOT gate suppression:
-    // both the deceleration tail (same direction) and the rebound
-    // (opposite direction) need to be suppressed for flick to work.
-    // If the user makes a genuine new flick during the cooldown
-    // (mag ≥ threshold), it re-arms as normal and is never suppressed.
-    bool is_flick_sample = (mag >= g_profile.flick_mag_threshold);
-    bool is_rebound = false;
+    // Post-flick suppression state machine. A cooldown is armed whenever
+    // a sample's magnitude crosses flick_mag_threshold, and every sample
+    // during the cooldown gets a widened deadzone + capped gain UNLESS
+    // it's classified as a fresh, deliberate flick (see is_flick_sample
+    // below).
+    //
+    // is_reversal (fix for item 1): a fast deceleration snap-back is
+    // real physical motion and can easily cross flick_mag_threshold
+    // itself -- the same speed the gain curve treats as "a flick". Using
+    // magnitude alone to decide "is this a new flick" meant the rebound
+    // was misclassified as a brand-new legitimate flick, passed straight
+    // through unsuppressed, and re-armed the cooldown pointed the wrong
+    // way. Direction fixes this: a sample during an active cooldown that
+    // is pointed opposite the flick that's cooling down (dot product
+    // below FLICK_REVERSAL_DOT) is a reversal regardless of how fast it
+    // is, and stays suppressed rather than bypassing as a new flick.
+    bool cooling_down = (g_flick_suppress_timer > 0);
+    bool is_reversal = false;
+    if (cooling_down && mag > 0.0f && (g_flick_dir_yaw != 0.0f || g_flick_dir_pitch != 0.0f)) {
+        float norm_x = yaw / mag;
+        float norm_y = pitch / mag;
+        float dot = g_flick_dir_yaw * norm_x + g_flick_dir_pitch * norm_y;
+        is_reversal = (dot < FLICK_REVERSAL_DOT);
+    }
+
+    // A sample only counts as "the flick itself" (bypasses suppression
+    // entirely and re-arms the cooldown in its own direction) if its
+    // magnitude clears the threshold AND it isn't a reversal of the
+    // flick currently on cooldown. A genuine new flick in a *different*
+    // (non-reversed) direction during the cooldown still re-arms as
+    // before.
+    bool is_flick_sample = (mag >= g_profile.flick_mag_threshold) && !is_reversal;
+
     if (is_flick_sample) {
         g_flick_suppress_timer = g_profile.flick_suppression_samples;
         if (mag > 0.0f) {
@@ -477,17 +499,18 @@ static void process_vector(float yaw, float pitch,
             g_flick_dir_yaw = 0.0f;
             g_flick_dir_pitch = 0.0f;
         }
-    } else if (g_flick_suppress_timer > 0) {
+    } else if (cooling_down) {
         g_flick_suppress_timer--;
-        // Diagnostic: is this sample moving opposite to the flick?
-        if (mag > 0.0f && (g_flick_dir_yaw != 0.0f || g_flick_dir_pitch != 0.0f)) {
-            float norm_x = yaw / mag;
-            float norm_y = pitch / mag;
-            float dot = g_flick_dir_yaw * norm_x + g_flick_dir_pitch * norm_y;
-            is_rebound = (dot < FLICK_REVERSAL_DOT);
-        }
     }
-    bool suppress_this_sample = (!is_flick_sample) && (g_flick_suppress_timer > 0);
+
+    // Fix for item 2 (off-by-one): use the pre-decrement `cooling_down`
+    // snapshot rather than re-reading g_flick_suppress_timer after the
+    // decrement above. The old code checked the timer post-decrement, so
+    // the sample that entered with timer == 1 decremented to 0 and was
+    // never suppressed -- flick_suppression_samples=12 only ever
+    // suppressed 11 samples. Checking the pre-decrement state suppresses
+    // exactly the configured number of samples.
+    bool suppress_this_sample = (!is_flick_sample) && cooling_down;
     g_debug.flick_suppress = suppress_this_sample ? 1 : 0;
 
     float effective_dead_zone = suppress_this_sample
