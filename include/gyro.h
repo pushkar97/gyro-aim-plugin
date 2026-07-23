@@ -23,7 +23,32 @@ typedef struct GyroProfile {
                              // stick deadzone doesn't eat it. Direction is
                              // preserved (not a per-axis floor — the
                              // vector preserves the intended angle).
-                             // Defaults to 20.
+                             // Defaults to 20. Ramped in, not snapped —
+                             // see dead_zone_bias_ramp_scale.
+    float dead_zone_bias_ramp_scale; // unitless (4.0 default). The
+                             // dead_zone_bias floor ramps linearly from
+                             // 0 at the dead-zone boundary up to the
+                             // full dead_zone_bias value as the input
+                             // magnitude grows from dead_zone to
+                             // dead_zone * dead_zone_bias_ramp_scale.
+                             // Previously the floor snapped straight to
+                             // dead_zone_bias for ANY sample that
+                             // cleared the dead zone at all, making the
+                             // boundary a binary gate (0 output on one
+                             // side, a fixed ~10-20 unit jump on the
+                             // other) rather than a true floor — small
+                             // enough that a residual bias error of
+                             // only 0.001-0.002 rad/s could reliably
+                             // decide which side of the gate a
+                             // borderline sample landed on, which reads
+                             // in-game as one direction being easy to
+                             // push and the other feeling dead. Ramping
+                             // means a small shift in exactly where the
+                             // boundary sits only shifts where the ramp
+                             // starts, not the size of a jump. Must be
+                             // > 1.0 to have any effect (a value of 1.0
+                             // or less falls back to the old snap
+                             // behavior).
     int trigger_threshold;
 
     // Gain curve (direction-independent): stick_magnitude = gain(rate_magnitude)
@@ -167,6 +192,24 @@ float saturation_strength;  // Soft-saturation applied to the output
                               // non-zero average. If any axis exceeds
                               // this threshold, the window is rejected.
                               // Independent of BiasStationarySamples.
+    float bias_max_total_deviation; // rad/s (0.10 default). Hard ceiling
+                              // on how far the runtime-estimated bias
+                              // is allowed to drift from the value
+                              // established at the last (re)calibration,
+                              // in either direction, per axis.
+                              // bias_max_correction_step alone only
+                              // bounds a single update's size -- it
+                              // doesn't stop many small same-direction
+                              // updates (e.g. a habitual resting-grip
+                              // tilt that repeatedly reads as
+                              // "stationary") from walking the bias
+                              // arbitrarily far over a long session,
+                              // which shows up in-game as the crosshair
+                              // becoming easy to push one direction and
+                              // increasingly dead/stuck in the opposite
+                              // direction. This clamp still allows
+                              // genuine slow sensor drift to be tracked,
+                              // just within a bounded radius.
     float sensitivity_h;         // 1.0 = no scaling. Applied to stick_x
                              // AFTER vector processing and BEFORE output
                              // EMA smoothing. Simple output multiplier

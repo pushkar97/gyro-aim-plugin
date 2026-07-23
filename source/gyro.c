@@ -135,6 +135,11 @@ static bool g_calibrated = false;
 static int g_calib_count = 0;          // accepted (stationary) samples
 static float g_calib_sum[3] = { 0, 0, 0 };
 static float g_bias[3] = { 0, 0, 0 };
+static float g_calibrated_bias[3] = { 0, 0, 0 };  // bias as of the last
+                                     // (re)calibration -- the anchor
+                                     // point runtime bias drift is
+                                     // clamped around (see
+                                     // bias_max_total_deviation)
 
 static bool g_is_stationary = false;  // global: raw gyro signal is flat
 static int g_stationary_timer = 0;  // global: consecutive samples the raw
@@ -213,6 +218,7 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->enabled = true;
     profile->dead_zone = 0.02f;
     profile->dead_zone_bias = 20;
+    profile->dead_zone_bias_ramp_scale = 4.0f;
     profile->trigger_threshold = 250;
     set_default_gain(profile->gain_rates_h, profile->gain_values_h, &profile->gain_count_h);
     profile->lowpass_alpha = 0.5f;
@@ -230,9 +236,10 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->bias_stationary_samples = 60;
     profile->bias_delta_ema_alpha = 0.2f;
     profile->bias_stillness_delta_threshold = 0.01f;
-    profile->bias_stillness_magnitude_threshold = 0.50f;
+    profile->bias_stillness_magnitude_threshold = 0.20f;
     profile->bias_settle_samples = 50;
     profile->bias_drift_accum_threshold = 0.01f;
+    profile->bias_max_total_deviation = 0.10f;
     profile->sensitivity_h = 1.0f;
     profile->sensitivity_v = 1.0f;
     profile->flick_mag_threshold = 1.00f;
@@ -292,6 +299,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_bool(table, section, "Enabled", &profile->enabled);
     ini_table_get_entry_as_float(table, section, "DeadZone", &profile->dead_zone);
     ini_table_get_entry_as_int(table, section, "DeadZoneBias", &profile->dead_zone_bias);
+    ini_table_get_entry_as_float(table, section, "DeadZoneBiasRampScale", &profile->dead_zone_bias_ramp_scale);
     ini_table_get_entry_as_int(table, section, "TriggerThreshold", &profile->trigger_threshold);
 
     load_gain_curve(table, section, "GainRates_H", "GainValues_H",
@@ -314,6 +322,7 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_float(table, section, "BiasStillnessMagnitudeThreshold", &profile->bias_stillness_magnitude_threshold);
     ini_table_get_entry_as_int(table, section, "BiasSettleSamples", &profile->bias_settle_samples);
     ini_table_get_entry_as_float(table, section, "BiasDriftAccumThreshold", &profile->bias_drift_accum_threshold);
+    ini_table_get_entry_as_float(table, section, "BiasMaxTotalDeviation", &profile->bias_max_total_deviation);
     ini_table_get_entry_as_float(table, section, "SensitivityH", &profile->sensitivity_h);
     ini_table_get_entry_as_float(table, section, "SensitivityV", &profile->sensitivity_v);
     ini_table_get_entry_as_float(table, section, "FlickMagThreshold", &profile->flick_mag_threshold);
@@ -347,6 +356,7 @@ void gyro_state_init(const GyroProfile* profile) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
+    memset(g_calibrated_bias, 0, sizeof(g_calibrated_bias));
     g_is_stationary = false;
     g_stationary_timer = 0;
     g_prev_gyro_valid = false;
@@ -386,6 +396,7 @@ static void start_recalibration(void) {
     g_calib_count = 0;
     memset(g_calib_sum, 0, sizeof(g_calib_sum));
     memset(g_bias, 0, sizeof(g_bias));
+    memset(g_calibrated_bias, 0, sizeof(g_calibrated_bias));
     g_is_stationary = false;
     g_stationary_timer = 0;
     g_prev_gyro_valid = false;
@@ -566,11 +577,45 @@ static void process_vector(float yaw, float pitch,
         // Scaling (raw_x, raw_y) as a vector (rather than flooring each
         // axis independently) preserves direction and avoids injecting
         // phantom movement into a near-zero secondary axis.
+        //
+        // Ramped, not snapped: the floor used to be a snap-to-constant —
+        // ANY sample whose natural output fell between 0 and
+        // dead_zone_bias got scaled straight up to exactly
+        // dead_zone_bias. Since the gain curve's lowest breakpoint sits
+        // right at/near dead_zone, gain is already close to max the
+        // instant a sample clears the dead zone, so nearly every
+        // post-deadzone sample landed in that range — meaning the
+        // dead-zone boundary was a binary gate (0 on one side, a fixed
+        // ~10-20 unit jump on the other) rather than a true floor. A
+        // bias residual as small as 0.001-0.002 rad/s is a meaningful
+        // fraction of the dead zone's own width and is enough to
+        // consistently decide which side of that gate a borderline
+        // sample lands on -- which reads in-game as one direction being
+        // "easy" and the other "dead", even though the underlying bias
+        // error is tiny. Ramping the floor from 0 at the dead-zone
+        // boundary up to dead_zone_bias over
+        // [effective_dead_zone, effective_dead_zone * dead_zone_bias_ramp_scale]
+        // means a tiny shift in exactly where the boundary sits only
+        // shifts where the ramp *starts*, not the size of a jump.
         float sat_vec_mag = sqrtf(raw_x * raw_x + raw_y * raw_y);
-        if (dead_zone_bias > 0 && sat_vec_mag > 0.0f && sat_vec_mag < (float)dead_zone_bias) {
-            float scale = (float)dead_zone_bias / sat_vec_mag;
-            raw_x *= scale;
-            raw_y *= scale;
+        if (dead_zone_bias > 0 && sat_vec_mag > 0.0f) {
+            float ramp_top = effective_dead_zone * g_profile.dead_zone_bias_ramp_scale;
+            float target_floor;
+            if (ramp_top > effective_dead_zone) {
+                float t = (mag - effective_dead_zone) / (ramp_top - effective_dead_zone);
+                if (t < 0.0f) t = 0.0f;
+                if (t > 1.0f) t = 1.0f;
+                target_floor = (float)dead_zone_bias * t;
+            } else {
+                // Degenerate ramp width (scale <= 1.0) -- fall back to
+                // the old snap behavior rather than divide by ~0.
+                target_floor = (float)dead_zone_bias;
+            }
+            if (sat_vec_mag < target_floor) {
+                float scale = target_floor / sat_vec_mag;
+                raw_x *= scale;
+                raw_y *= scale;
+            }
         }
 
         // Per-axis sensitivity scaling (applied after all vector
@@ -669,6 +714,9 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
             g_bias[0] = g_calib_sum[0] / (float)g_calib_count;
             g_bias[1] = g_calib_sum[1] / (float)g_calib_count;
             g_bias[2] = g_calib_sum[2] / (float)g_calib_count;
+            g_calibrated_bias[0] = g_bias[0];
+            g_calibrated_bias[1] = g_bias[1];
+            g_calibrated_bias[2] = g_bias[2];
             g_calibrated = true;
             log_info("gyro calibration complete: bias=[%f %f %f]\n",
                      g_bias[0], g_bias[1], g_bias[2]);
@@ -795,6 +843,22 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                             if (step > g_profile.bias_max_correction_step) step = g_profile.bias_max_correction_step;
                             if (step < -g_profile.bias_max_correction_step) step = -g_profile.bias_max_correction_step;
                             g_bias[i] += step;
+                            // bias_max_correction_step above only bounds
+                            // the size of a SINGLE step -- it does not
+                            // stop many small steps in the same
+                            // direction (e.g. a habitual resting-grip
+                            // tilt that repeatedly passes the stillness
+                            // gates) from walking g_bias arbitrarily far
+                            // from where it was actually calibrated.
+                            // Clamp cumulative drift to a fixed radius
+                            // around the calibrated anchor so runtime
+                            // correction can still track real slow
+                            // sensor drift without being able to eat
+                            // into one whole direction of aim.
+                            float lo = g_calibrated_bias[i] - g_profile.bias_max_total_deviation;
+                            float hi = g_calibrated_bias[i] + g_profile.bias_max_total_deviation;
+                            if (g_bias[i] < lo) g_bias[i] = lo;
+                            if (g_bias[i] > hi) g_bias[i] = hi;
                         }
                         g_bias_log_counter++;
                         if (g_bias_log_counter >= BIAS_LOG_INTERVAL) {
