@@ -176,6 +176,17 @@ static float g_drift_acc[3] = { 0, 0, 0 };
 // Edge-detection: did the last sample have L2 pressed?
 static bool g_was_aiming = false;
 
+// Drift-check failure tracking: consecutive windows where the drift
+// accumulator rejected the update. Escalates the correction rate after
+// repeated failures — a single failure may be transient motion, but
+// many in a row indicate a bad initial calibration that must be fixed.
+static int g_drift_fail_consecutive = 0;
+
+// Red flash counter: when the drift check blocks a bias update, the
+// lightbar turns red for this many samples to indicate the issue.
+#define DRIFT_FAIL_FLASH_SAMPLES 60
+static int g_drift_fail_flash = 0;
+
 static GyroDebug g_debug;
 
 static float g_float_stick_x = 0.0f;
@@ -354,6 +365,8 @@ void gyro_state_init(const GyroProfile* profile) {
     g_settle_timer = 0;
     memset(g_drift_acc, 0, sizeof(g_drift_acc));
     g_was_aiming = false;
+    g_drift_fail_consecutive = 0;
+    g_drift_fail_flash = 0;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -386,6 +399,8 @@ static void start_recalibration(void) {
     g_settle_timer = 0;
     memset(g_drift_acc, 0, sizeof(g_drift_acc));
     g_was_aiming = false;
+    g_drift_fail_consecutive = 0;
+    g_drift_fail_flash = 0;
 }
 
 static void set_lightbar(int32_t handle, LightbarState state) {
@@ -772,6 +787,7 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                         }
                     }
                     if (drift_ok) {
+                        g_drift_fail_consecutive = 0;
                         float errors[3];
                         for (int i = 0; i < 3; i++) {
                             errors[i] = raw[i] - g_bias[i];
@@ -794,17 +810,33 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                         }
                     } else {
                         g_debug.bias_active = 0;
+                        g_drift_fail_consecutive++;
+                        g_drift_fail_flash = DRIFT_FAIL_FLASH_SAMPLES;
+
                         static int drift_fail_counter = 0;
                         drift_fail_counter++;
                         if (drift_fail_counter >= BIAS_LOG_INTERVAL) {
                             drift_fail_counter = 0;
-                            float tmp_timer = (float)g_stationary_timer;
                             float avg[3];
-                            avg[0] = g_drift_acc[0] / tmp_timer;
-                            avg[1] = g_drift_acc[1] / tmp_timer;
-                            avg[2] = g_drift_acc[2] / tmp_timer;
-                            log_info("bias: drift check FAILED (avg error X=%+.4f Y=%+.4f Z=%+.4f, threshold=%.4f)\n",
-                                     avg[0], avg[1], avg[2], g_profile.bias_drift_accum_threshold);
+                            avg[0] = g_drift_acc[0] / (float)g_stationary_timer;
+                            avg[1] = g_drift_acc[1] / (float)g_stationary_timer;
+                            avg[2] = g_drift_acc[2] / (float)g_stationary_timer;
+                            log_info("bias: drift check FAILED (avg error X=%+.4f Y=%+.4f Z=%+.4f, threshold=%.4f, consecutive=%d)\n",
+                                     avg[0], avg[1], avg[2], g_profile.bias_drift_accum_threshold,
+                                     g_drift_fail_consecutive);
+                        }
+
+                        float fail_alpha = g_profile.bias_alpha;
+                        if (g_drift_fail_consecutive < 3) {
+                            fail_alpha *= 0.2f;
+                        }
+                        for (int i = 0; i < 3; i++) {
+                            float step = fail_alpha * (raw[i] - g_bias[i]);
+                            if (step > g_profile.bias_max_correction_step)
+                                step = g_profile.bias_max_correction_step;
+                            if (step < -g_profile.bias_max_correction_step)
+                                step = -g_profile.bias_max_correction_step;
+                            g_bias[i] += step;
                         }
                     }
                     // Consume the stationary window — reset both the
@@ -844,6 +876,12 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
         g_flick_suppress_timer = 0;
         g_flick_dir_yaw = 0.0f;
         g_flick_dir_pitch = 0.0f;
+
+        if (g_drift_fail_flash > 0) {
+            g_drift_fail_flash--;
+            platform_set_lightbar(handle, 255, 30, 30);
+            g_lightbar_state = LB_UNSET;
+        }
         return;
     }
 
