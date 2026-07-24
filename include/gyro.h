@@ -245,6 +245,65 @@ float saturation_strength;  // Soft-saturation applied to the output
                              // high-speed gain, so anything that does
                              // clear the widened dead zone isn't boosted
                              // as if it were slow, deliberate aim.
+
+    // Physical stick drift compensation: many DS4/DS5 controllers'
+    // analog stick potentiometers rest away from the nominal center
+    // (128,128), which write_stick_uint8 sums gyro output onto --
+    // uncorrected, that drift becomes a constant phantom push in one
+    // direction regardless of gyro input, all the time. Mirrors the
+    // gyro bias estimator's (corrected) two-gate pattern: a sample only
+    // counts as a rest-position candidate if it's both flat (not being
+    // actively moved) AND within a fixed, physically-plausible distance
+    // of the NOMINAL center (not the current learned estimate -- using
+    // the current estimate as the gate would reintroduce the exact
+    // deadlock a bad initial gyro bias guess once caused: a badly-off
+    // learned center could never correct itself if "close to the
+    // current estimate" were the precondition for moving it). A
+    // deliberate stick push is typically a much larger deflection than
+    // any real pot drift, so it's naturally excluded by the plausible-
+    // drift bound rather than needing to be detected directly.
+    bool stick_drift_correction_enabled;  // true (default): learn the
+                             // physical stick's actual rest position at
+                             // runtime and measure deflection relative
+                             // to it instead of the nominal 128. Only
+                             // runs while NOT aiming (L2 released) --
+                             // the only time the raw hardware stick
+                             // reading is guaranteed not to already
+                             // include something this plugin wrote.
+    float stick_center_alpha;    // EMA blend per accepted sample (0.01
+                             // default). As slow as bias_alpha by
+                             // design -- this should track genuine,
+                             // slow-changing pot characteristics, not
+                             // react to anything quickly.
+    float stick_center_max_correction_step; // stick units (0.5 default).
+                             // Bounds a single update's size, same role
+                             // as bias_max_correction_step.
+    int stick_stationary_samples; // consecutive flat samples required
+                             // before a rest-position update is applied
+                             // (60 default, matches bias_stationary_
+                             // samples' default cadence).
+    float stick_delta_ema_alpha; // EMA smoothing (0.2 default) for the
+                             // per-axis sample-to-sample delta used to
+                             // detect the stick isn't being moved.
+    float stick_stillness_delta_threshold; // stick units (1.0 default).
+                             // The smoothed delta must stay below this
+                             // to count as flat. Set comfortably above
+                             // normal ADC read jitter on a held-still
+                             // stick.
+    float stick_max_plausible_drift; // stick units (30.0 default).
+                             // Fixed bound, measured from the NOMINAL
+                             // center (128), not the current learned
+                             // estimate -- see the struct-level comment
+                             // above for why this must stay fixed. A
+                             // flat reading further than this from 128
+                             // is treated as a deliberate held
+                             // deflection, not drift, and is never
+                             // learned as the rest position.
+    float stick_center_max_deviation; // stick units (40.0 default).
+                             // Hard ceiling on how far the learned
+                             // center may drift from the nominal 128,
+                             // per axis, in either direction -- same
+                             // safety role as bias_max_total_deviation.
 } GyroProfile;
 
 // Loads [default] then overlays [<titleid>] (if present) from the given INI

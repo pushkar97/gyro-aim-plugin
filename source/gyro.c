@@ -181,6 +181,29 @@ static float g_drift_acc[3] = { 0, 0, 0 };
 // Edge-detection: did the last sample have L2 pressed?
 static bool g_was_aiming = false;
 
+// Physical stick drift compensation: DS4/DS5 analog stick potentiometers
+// commonly drift from their nominal rest position (128,128) over the life
+// of the controller (and can shift further as it warms up mid-session).
+// write_stick_uint8 sums gyro output ONTO the physical stick's current
+// reading -- if that reading never actually rests at 128 when untouched,
+// the drift becomes a constant phantom push in one direction, all the
+// time, independent of anything the gyro is doing. g_stick_center tracks
+// the LEARNED rest position per axis so physical deflection is measured
+// relative to where the stick actually rests, not the nominal constant.
+// Deliberately mirrors the (corrected) gyro bias estimator's two-gate
+// pattern: flatness (not moving) + a threshold that is a FIXED physical
+// bound rather than relative to the current estimate (to avoid the same
+// deadlock a bad initial guess could otherwise cause), plus a bounded
+// total deviation. Learned only while not aiming (see gyro_process_sample)
+// since that's the only time pData->rightStick is guaranteed to still be
+// the raw untouched hardware reading, not something write_stick_uint8 has
+// already written to.
+static float g_stick_center[2] = { (float)STICK_CENTER, (float)STICK_CENTER };
+static float g_stick_prev[2] = { 0, 0 };
+static bool g_stick_prev_valid = false;
+static float g_stick_delta_ema[2] = { 0, 0 };
+static int g_stick_stationary_timer = 0;
+
 // Drift-check failure tracking: consecutive windows where the drift
 // accumulator rejected the update. Escalates the correction rate after
 // repeated failures — a single failure may be transient motion, but
@@ -246,6 +269,14 @@ void gyro_profile_set_defaults(GyroProfile* profile) {
     profile->flick_suppression_samples = 12;
     profile->flick_suppression_deadzone_scale = 5.0f;
     profile->flick_suppression_gain_cap = 30.0f;
+    profile->stick_drift_correction_enabled = true;
+    profile->stick_center_alpha = 0.01f;
+    profile->stick_center_max_correction_step = 0.5f;
+    profile->stick_stationary_samples = 60;
+    profile->stick_delta_ema_alpha = 0.2f;
+    profile->stick_stillness_delta_threshold = 1.0f;
+    profile->stick_max_plausible_drift = 30.0f;
+    profile->stick_center_max_deviation = 40.0f;
 }
 
 static int parse_float_list(const char* str, float* out, int max_count) {
@@ -329,6 +360,14 @@ static void load_section(ini_table_s* table, const char* section, GyroProfile* p
     ini_table_get_entry_as_int(table, section, "FlickSuppressionSamples", &profile->flick_suppression_samples);
     ini_table_get_entry_as_float(table, section, "FlickSuppressionDeadzoneScale", &profile->flick_suppression_deadzone_scale);
     ini_table_get_entry_as_float(table, section, "FlickSuppressionGainCap", &profile->flick_suppression_gain_cap);
+    ini_table_get_entry_as_bool(table, section, "StickDriftCorrectionEnabled", &profile->stick_drift_correction_enabled);
+    ini_table_get_entry_as_float(table, section, "StickCenterAlpha", &profile->stick_center_alpha);
+    ini_table_get_entry_as_float(table, section, "StickCenterMaxCorrectionStep", &profile->stick_center_max_correction_step);
+    ini_table_get_entry_as_int(table, section, "StickStationarySamples", &profile->stick_stationary_samples);
+    ini_table_get_entry_as_float(table, section, "StickDeltaEmaAlpha", &profile->stick_delta_ema_alpha);
+    ini_table_get_entry_as_float(table, section, "StickStillnessDeltaThreshold", &profile->stick_stillness_delta_threshold);
+    ini_table_get_entry_as_float(table, section, "StickMaxPlausibleDrift", &profile->stick_max_plausible_drift);
+    ini_table_get_entry_as_float(table, section, "StickCenterMaxDeviation", &profile->stick_center_max_deviation);
 }
 
 bool gyro_profile_load(const char* ini_path, const char* title_id, GyroProfile* profile) {
@@ -377,6 +416,18 @@ void gyro_state_init(const GyroProfile* profile) {
     g_was_aiming = false;
     g_drift_fail_consecutive = 0;
     g_drift_fail_flash = 0;
+    // Stick-center drift tracking is intentionally reset ONLY here, not
+    // in start_recalibration(). The touchpad-hold hotkey recalibrates
+    // gyro RATE bias -- unrelated to the physical stick's learned rest
+    // position. Resetting a good stick-center estimate on every manual
+    // gyro recalibration would force it to reconverge from nominal 128
+    // each time, reintroducing the phantom-push asymmetry for the
+    // duration of that reconvergence for no gyro-related reason.
+    g_stick_center[0] = (float)STICK_CENTER;
+    g_stick_center[1] = (float)STICK_CENTER;
+    g_stick_prev_valid = false;
+    memset(g_stick_delta_ema, 0, sizeof(g_stick_delta_ema));
+    g_stick_stationary_timer = 0;
 }
 
 void gyro_set_profile(const GyroProfile* profile) {
@@ -643,12 +694,19 @@ static void process_vector(float yaw, float pitch,
 
 // Write a float stick value to uint8, summing with the physical stick
 // position. DeadZoneBias is already handled upstream in process_vector()
-// — this is just the final conversion + clamp.
-static void write_stick_uint8(uint8_t* axis, float stick) {
-    int phys = (int)(*axis) - STICK_CENTER;
+// — this is just the final conversion + clamp. `center` is the learned
+// rest position for this axis (see the stick drift compensation block
+// in gyro_process_sample) rather than the nominal STICK_CENTER constant
+// -- physical deflection is measured relative to where the stick
+// actually rests, so a drifted pot doesn't read as a constant phantom
+// input. The OUTPUT is still re-biased around the nominal STICK_CENTER,
+// since that's what the game itself expects as center.
+static void write_stick_uint8(uint8_t* axis, float stick, float center) {
+    int phys = (int)(*axis) - (int)lroundf(center);
     int combined = clamp_int(phys + lroundf(stick), -128, 127);
     *axis = (uint8_t)clamp_int(combined + STICK_CENTER, STICK_MIN, STICK_MAX);
 }
+
 void gyro_process_sample(int32_t handle, ScePadData* pData) {
     if (!pData->connected) {
         return;
@@ -920,6 +978,76 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                 memset(g_drift_acc, 0, sizeof(g_drift_acc));
             }
         }
+
+        // --- Physical stick drift compensation ---
+        // Independent of the gyro bias block above: different sensor,
+        // different failure mode, no reason to share gating state with
+        // it. Runs whenever not aiming, using the raw hardware stick
+        // reading (pData->rightStick is guaranteed untouched here --
+        // write_stick_uint8 is only ever called from the aiming path
+        // below, after this block has already returned).
+        if (g_profile.stick_drift_correction_enabled) {
+            float raw_stick[2] = { (float)pData->rightStick.x, (float)pData->rightStick.y };
+
+            // Flatness gate: same idea as the gyro delta check -- a
+            // stick sitting still (whether truly at rest or resting at
+            // its drifted position) reads near-constant sample to
+            // sample. A stick actively being pushed toward a new
+            // position does not.
+            bool stick_flat = g_stick_prev_valid;
+            if (g_stick_prev_valid) {
+                for (int i = 0; i < 2; i++) {
+                    float delta = fabsf(raw_stick[i] - g_stick_prev[i]);
+                    g_stick_delta_ema[i] += g_profile.stick_delta_ema_alpha * (delta - g_stick_delta_ema[i]);
+                    if (g_stick_delta_ema[i] >= g_profile.stick_stillness_delta_threshold) {
+                        stick_flat = false;
+                    }
+                }
+            }
+            g_stick_prev[0] = raw_stick[0];
+            g_stick_prev[1] = raw_stick[1];
+            g_stick_prev_valid = true;
+
+            // Plausible-drift gate: measured from the fixed nominal
+            // center (128), NOT g_stick_center -- see the GyroProfile
+            // struct comment for why using the current estimate here
+            // would risk the same deadlock the gyro bias estimator once
+            // had. A deliberate held deflection is typically far larger
+            // than any real pot drift and is naturally excluded by this
+            // bound without needing to be detected directly.
+            bool stick_plausible = true;
+            for (int i = 0; i < 2; i++) {
+                if (fabsf(raw_stick[i] - (float)STICK_CENTER) > g_profile.stick_max_plausible_drift) {
+                    stick_plausible = false;
+                    break;
+                }
+            }
+
+            if (stick_flat && stick_plausible) {
+                g_stick_stationary_timer++;
+                if (g_stick_stationary_timer >= g_profile.stick_stationary_samples) {
+                    for (int i = 0; i < 2; i++) {
+                        float error = raw_stick[i] - g_stick_center[i];
+                        float step = g_profile.stick_center_alpha * error;
+                        if (step > g_profile.stick_center_max_correction_step) step = g_profile.stick_center_max_correction_step;
+                        if (step < -g_profile.stick_center_max_correction_step) step = -g_profile.stick_center_max_correction_step;
+                        g_stick_center[i] += step;
+                        // Bound total deviation from the nominal center,
+                        // same safety role as bias_max_total_deviation.
+                        float lo = (float)STICK_CENTER - g_profile.stick_center_max_deviation;
+                        float hi = (float)STICK_CENTER + g_profile.stick_center_max_deviation;
+                        if (g_stick_center[i] < lo) g_stick_center[i] = lo;
+                        if (g_stick_center[i] > hi) g_stick_center[i] = hi;
+                    }
+                    // Consume the window, same pattern as the gyro bias
+                    // block -- next update needs a fresh full window.
+                    g_stick_stationary_timer = 0;
+                }
+            } else {
+                g_stick_stationary_timer = 0;
+            }
+        }
+
         // Damped L2 release: decay float_stick toward zero instead of
         // snapping instantly. Feathering L2 then feels smooth — the
         // stick picks up roughly where it left off rather than
@@ -977,6 +1105,6 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                    g_profile.lowpass_alpha, g_profile.damping_factor,
                    g_profile.dead_zone, g_profile.saturation_strength, g_profile.dead_zone_bias);
 
-    write_stick_uint8(&pData->rightStick.x, g_float_stick_x);
-    write_stick_uint8(&pData->rightStick.y, g_float_stick_y);
+    write_stick_uint8(&pData->rightStick.x, g_float_stick_x, g_stick_center[0]);
+    write_stick_uint8(&pData->rightStick.y, g_float_stick_y, g_stick_center[1]);
 }

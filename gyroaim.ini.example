@@ -29,6 +29,14 @@ FlickMagThreshold = 0.40
 FlickSuppressionSamples = 30
 FlickSuppressionDeadzoneScale = 5.0
 FlickSuppressionGainCap = 30.0
+StickDriftCorrectionEnabled = true
+StickCenterAlpha = 0.01
+StickCenterMaxCorrectionStep = 0.5
+StickStationarySamples = 60
+StickDeltaEmaAlpha = 0.2
+StickStillnessDeltaThreshold = 1.0
+StickMaxPlausibleDrift = 30.0
+StickCenterMaxDeviation = 40.0
 
 ; Example per-title override. Replace CUSA00001 with a real title ID
 ; (visible via GoldHEN debug logs / sys_sdk_proc_info at plugin_load).
