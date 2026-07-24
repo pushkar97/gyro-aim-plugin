@@ -935,6 +935,25 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                         g_drift_fail_consecutive++;
                         g_drift_fail_flash = DRIFT_FAIL_FLASH_SAMPLES;
 
+                        // Diagnostic only -- deliberately does NOT apply
+                        // any bias correction here. A rejected window
+                        // means the stationary-looking signal has a
+                        // real, consistent non-zero average (e.g.
+                        // habitual resting-grip tilt), which is exactly
+                        // what the windowed drift check exists to catch
+                        // and refuse. Applying a correction anyway after
+                        // enough consecutive rejections -- as a prior
+                        // version of this code did -- treats "the check
+                        // keeps failing" as "the check must be wrong,"
+                        // which defeats its purpose: a habitual tilt
+                        // fails consistently BY DEFINITION, and would
+                        // eventually get learned in at full strength.
+                        // If the same axis rejects for many consecutive
+                        // windows, that's a signal worth surfacing (the
+                        // log line below, plus the lightbar flash) so
+                        // the player can manually recalibrate in a
+                        // genuinely neutral position -- not a signal to
+                        // silently override.
                         static int drift_fail_counter = 0;
                         drift_fail_counter++;
                         if (drift_fail_counter >= BIAS_LOG_INTERVAL) {
@@ -946,19 +965,6 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
                             log_info("bias: drift check FAILED (avg error X=%+.4f Y=%+.4f Z=%+.4f, threshold=%.4f, consecutive=%d)\n",
                                      avg[0], avg[1], avg[2], g_profile.bias_drift_accum_threshold,
                                      g_drift_fail_consecutive);
-                        }
-
-                        float fail_alpha = g_profile.bias_alpha;
-                        if (g_drift_fail_consecutive < 3) {
-                            fail_alpha *= 0.2f;
-                        }
-                        for (int i = 0; i < 3; i++) {
-                            float step = fail_alpha * (raw[i] - g_bias[i]);
-                            if (step > g_profile.bias_max_correction_step)
-                                step = g_profile.bias_max_correction_step;
-                            if (step < -g_profile.bias_max_correction_step)
-                                step = -g_profile.bias_max_correction_step;
-                            g_bias[i] += step;
                         }
                     }
                     // Consume the stationary window — reset both the
@@ -1078,6 +1084,15 @@ void gyro_process_sample(int32_t handle, ScePadData* pData) {
     }
 
     // --- Response model: vector-based (gain curve -> saturation -> DeadZoneBias -> EMA) ---
+    // g_debug.stillness/bias_active are only meaningful while NOT
+    // aiming (bias estimation never runs during aim by design) --
+    // without this reset they'd keep showing whatever was true the
+    // instant before L2 was pressed for the entire aiming session,
+    // which reads on the HUD as "bias tracking is active" when it
+    // isn't.
+    g_debug.stillness = 0;
+    g_debug.bias_active = 0;
+
     // L2 is pressed — update edge detector and reset the release counter
     // so the next release-to-damping cycle starts fresh.
     g_was_aiming = true;
